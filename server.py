@@ -1,35 +1,27 @@
 """
 Memory Agent — MCP Server for Claude Code
-Persistent structured memory using SQLite + Claude Haiku.
+Persistent structured memory using SQLite + local Qwen (Ollama).
 No vector databases. LLM-driven categorization, dedup, and ranking.
 """
 
 import json
 import os
+import re
 import sqlite3
+import urllib.request
 import uuid
 from datetime import datetime, timezone
 
-import anthropic
 from mcp.server.fastmcp import FastMCP
 
 # --- Config ---
 DB_DIR = os.path.join(os.path.expanduser("~"), ".claude", "memory")
 DB_PATH = os.path.join(DB_DIR, "memory.db")
-HAIKU_MODEL = "claude-haiku-4-5-20251001"
+OLLAMA_URL = os.environ.get("OLLAMA_URL", "http://localhost:11434")
+OLLAMA_MODEL = os.environ.get("OLLAMA_MODEL", "qwen2.5:14b")
 
 # --- Init ---
 os.makedirs(DB_DIR, exist_ok=True)
-
-# API key: env var > ~/.claude/memory/.api_key file
-api_key = os.environ.get("ANTHROPIC_API_KEY", "")
-if not api_key:
-    key_file = os.path.join(DB_DIR, ".api_key")
-    if os.path.exists(key_file):
-        with open(key_file) as f:
-            api_key = f.read().strip()
-
-client = anthropic.Anthropic(api_key=api_key) if api_key else None
 mcp = FastMCP("memory-agent")
 
 
@@ -75,16 +67,21 @@ init_db()
 
 # --- Haiku helpers ---
 
-def haiku_call(system: str, user: str) -> str:
-    if not client:
-        raise RuntimeError("No API key configured. Set ANTHROPIC_API_KEY or create ~/.claude/memory/.api_key")
-    resp = client.messages.create(
-        model=HAIKU_MODEL,
-        max_tokens=1024,
-        system=system,
-        messages=[{"role": "user", "content": user}],
+def llm_call(system: str, user: str) -> str:
+    payload = json.dumps({
+        "model": OLLAMA_MODEL,
+        "prompt": f"{system}\n\n{user}",
+        "stream": False,
+        "options": {"temperature": 0.1, "num_predict": 1024},
+    }).encode()
+    req = urllib.request.Request(
+        f"{OLLAMA_URL}/api/generate",
+        data=payload,
+        headers={"Content-Type": "application/json"},
     )
-    return resp.content[0].text
+    with urllib.request.urlopen(req, timeout=30) as resp:
+        data = json.loads(resp.read())
+    return data.get("response", "")
 
 
 def extract_memory_metadata(content: str, scope: str, existing_memories: list[dict]) -> dict:
@@ -114,7 +111,7 @@ If merging, set merge_with_id to the existing memory's id and merged_content to 
     user = f"New memory to store (scope: {scope}):\n{content}{existing_text}"
 
     try:
-        raw = haiku_call(system, user)
+        raw = llm_call(system, user)
         # Extract JSON from response
         start = raw.find("{")
         end = raw.rfind("}") + 1
@@ -150,7 +147,7 @@ Return at most the number requested."""
     user = f"Query: {query}\nReturn top {limit} results.\n\nCandidates:\n{cand_text}"
 
     try:
-        raw = haiku_call(system, user)
+        raw = llm_call(system, user)
         start = raw.find("[")
         end = raw.rfind("]") + 1
         if start >= 0 and end > start:
@@ -262,7 +259,6 @@ def memory_query(query: str, scope: str = "", category: str = "", limit: int = 1
                   "why", "can", "could", "will", "would", "should", "may", "might", "shall", "for", "and",
                   "but", "or", "not", "no", "with", "from", "about", "into", "over", "after", "before"}
     try:
-        import re
         words = [re.sub(r'[^\w]', '', w).lower() for w in query.split()[:10]]
         words = [w for w in words if len(w) > 2 and w not in stop_words]
         if words:
@@ -286,7 +282,6 @@ def memory_query(query: str, scope: str = "", category: str = "", limit: int = 1
 
     # Fallback: if FTS returned too few, supplement with LIKE search
     if len(candidates) < 5:
-        import re
         like_words = [re.sub(r'[^\w]', '', w).lower() for w in query.split()[:10]]
         like_words = [w for w in like_words if len(w) > 2 and w not in stop_words][:5]
         like_conditions = list(conditions)
@@ -433,7 +428,7 @@ If nothing needs consolidation, return {"actions": [], "summary": "all memories 
     user = f"Scope: {scope}\nMemories ({len(memories)} total):\n\n{mem_text}"
 
     try:
-        raw = haiku_call(system, user)
+        raw = llm_call(system, user)
         start = raw.find("{")
         end = raw.rfind("}") + 1
         if start >= 0 and end > start:
