@@ -1,21 +1,23 @@
 """
-Integration tests for Memory Agent MCP server with Ollama/Qwen.
+Integration tests for Memory Agent MCP server with Bedrock/Haiku.
 All test data uses scope='__test__' to avoid polluting real memories.
 Run: python test_integration.py
 """
 
 import json
 import os
-import sqlite3
 import sys
 import time
 
 # Patch DB to use a test database
 TEST_DB = os.path.join(os.path.expanduser("~"), ".claude", "memory", "memory_test.db")
 
-import server
-server.DB_PATH = TEST_DB
-server.init_db()
+import db
+import llm
+import tools
+
+db.DB_PATH = TEST_DB
+db.init_db()
 
 PASS = 0
 FAIL = 0
@@ -36,38 +38,41 @@ def fail(name, reason):
 
 def cleanup():
     """Remove all test data."""
-    conn = server.get_db()
+    conn = db.get_db()
     conn.execute("DELETE FROM memories WHERE scope = ?", (SCOPE,))
     try:
-        conn.execute("DELETE FROM memories_fts WHERE id IN (SELECT id FROM memories WHERE scope = ?)", (SCOPE,))
+        conn.execute(
+            "DELETE FROM memories_fts WHERE id IN (SELECT id FROM memories WHERE scope = ?)",
+            (SCOPE,),
+        )
     except Exception:
         pass
     conn.commit()
     conn.close()
 
 
-def test_ollama_reachable():
-    """Verify Ollama is running and the model is loaded."""
-    import urllib.request
+def test_bedrock_reachable():
+    """Verify Bedrock is reachable and the model responds."""
     try:
-        req = urllib.request.Request(f"{server.OLLAMA_URL}/api/tags")
-        with urllib.request.urlopen(req, timeout=5) as resp:
-            data = json.loads(resp.read())
-        models = [m["name"] for m in data.get("models", [])]
-        if server.OLLAMA_MODEL in models or any(server.OLLAMA_MODEL.split(":")[0] in m for m in models):
-            ok("ollama_reachable")
+        response = llm.bedrock.converse(
+            modelId=llm.BEDROCK_MODEL,
+            messages=[{"role": "user", "content": [{"text": "Say hello."}]}],
+            inferenceConfig={"maxTokens": 16},
+        )
+        text = response["output"]["message"]["content"][0]["text"]
+        if text:
+            ok("bedrock_reachable")
         else:
-            fail("ollama_reachable", f"Model {server.OLLAMA_MODEL} not found. Available: {models}")
+            fail("bedrock_reachable", "Empty response from Bedrock")
     except Exception as e:
-        fail("ollama_reachable", str(e))
+        fail("bedrock_reachable", str(e))
 
 
 def test_llm_returns_json():
     """Verify the LLM can return valid JSON."""
     try:
-        raw = server.llm_call(
-            "Respond with ONLY valid JSON.",
-            '{"color": "blue", "count": 3}'
+        raw = llm.llm_call(
+            "Respond with ONLY valid JSON.", '{"color": "blue", "count": 3}'
         )
         start = raw.find("{")
         end = raw.rfind("}") + 1
@@ -82,7 +87,9 @@ def test_llm_returns_json():
 
 def test_store_basic():
     """Store a memory and verify it exists in DB."""
-    result = server.memory_store("Test memory: the sky is blue", scope=SCOPE, source="integration_test")
+    result = tools.memory_store(
+        "Test memory: the sky is blue", scope=SCOPE, source="integration_test"
+    )
     if "Stored memory" in result:
         ok("store_basic")
     else:
@@ -91,8 +98,10 @@ def test_store_basic():
 
 def test_store_categorization():
     """Verify the LLM assigns a valid category."""
-    result = server.memory_store("User always prefers dark mode in all editors", scope=SCOPE)
-    conn = server.get_db()
+    result = tools.memory_store(
+        "User always prefers dark mode in all editors", scope=SCOPE
+    )
+    conn = db.get_db()
     row = conn.execute(
         "SELECT category FROM memories WHERE scope = ? ORDER BY created_at DESC LIMIT 1",
         (SCOPE,),
@@ -102,13 +111,16 @@ def test_store_categorization():
     if row and row["category"] in valid:
         ok(f"store_categorization (got: {row['category']})")
     else:
-        fail("store_categorization", f"Invalid category: {row['category'] if row else 'no row'}")
+        fail(
+            "store_categorization",
+            f"Invalid category: {row['category'] if row else 'no row'}",
+        )
 
 
 def test_store_tags():
     """Verify the LLM extracts tags."""
-    server.memory_store("Python 3.11 is installed at C:/Python311", scope=SCOPE)
-    conn = server.get_db()
+    tools.memory_store("Python 3.11 is installed at C:/Python311", scope=SCOPE)
+    conn = db.get_db()
     row = conn.execute(
         "SELECT tags FROM memories WHERE scope = ? AND content LIKE '%Python%' LIMIT 1",
         (SCOPE,),
@@ -122,7 +134,7 @@ def test_store_tags():
 
 def test_store_importance():
     """Verify importance is assigned between 1-5."""
-    conn = server.get_db()
+    conn = db.get_db()
     rows = conn.execute(
         "SELECT importance FROM memories WHERE scope = ?", (SCOPE,)
     ).fetchall()
@@ -137,11 +149,15 @@ def test_store_importance():
 def test_store_merge():
     """Store two similar memories and verify dedup/merge."""
     cleanup()
-    server.memory_store("The project uses React 18 with TypeScript", scope=SCOPE)
+    tools.memory_store("The project uses React 18 with TypeScript", scope=SCOPE)
     time.sleep(0.5)
-    result = server.memory_store("The project uses React 18 with TypeScript and Vite", scope=SCOPE)
-    conn = server.get_db()
-    count = conn.execute("SELECT COUNT(*) as c FROM memories WHERE scope = ?", (SCOPE,)).fetchone()["c"]
+    result = tools.memory_store(
+        "The project uses React 18 with TypeScript and Vite", scope=SCOPE
+    )
+    conn = db.get_db()
+    count = conn.execute(
+        "SELECT COUNT(*) as c FROM memories WHERE scope = ?", (SCOPE,)
+    ).fetchone()["c"]
     conn.close()
     if "Merged" in result:
         ok(f"store_merge (merged, {count} memories)")
@@ -149,15 +165,17 @@ def test_store_merge():
         ok(f"store_merge (deduped to 1 memory)")
     else:
         # Merge isn't guaranteed — LLM might see them as different enough
-        fail("store_merge", f"Expected merge but got {count} memories. Result: {result}")
+        fail(
+            "store_merge", f"Expected merge but got {count} memories. Result: {result}"
+        )
 
 
 def test_query_fts():
     """Query by keyword and get relevant results."""
     cleanup()
-    server.memory_store("Arduino Uno R3 is connected on COM3", scope=SCOPE)
-    server.memory_store("Obsidian vault is at ~/Documents", scope=SCOPE)
-    result = server.memory_query("Arduino board", scope=SCOPE)
+    tools.memory_store("Arduino Uno R3 is connected on COM3", scope=SCOPE)
+    tools.memory_store("Obsidian vault is at ~/Documents", scope=SCOPE)
+    result = tools.memory_query("Arduino board", scope=SCOPE)
     if "Arduino" in result and "Found" in result:
         ok("query_fts")
     else:
@@ -167,8 +185,8 @@ def test_query_fts():
 def test_query_like_fallback():
     """Query with unusual terms that might not be in FTS."""
     cleanup()
-    server.memory_store("The xyzzy_config.toml file controls deployment", scope=SCOPE)
-    result = server.memory_query("xyzzy_config", scope=SCOPE)
+    tools.memory_store("The xyzzy_config.toml file controls deployment", scope=SCOPE)
+    result = tools.memory_query("xyzzy_config", scope=SCOPE)
     if "xyzzy" in result.lower():
         ok("query_like_fallback")
     else:
@@ -177,7 +195,7 @@ def test_query_like_fallback():
 
 def test_query_empty():
     """Query an empty scope returns no results."""
-    result = server.memory_query("anything", scope="__empty_test__")
+    result = tools.memory_query("anything", scope="__empty_test__")
     if "No memories found" in result:
         ok("query_empty")
     else:
@@ -187,10 +205,10 @@ def test_query_empty():
 def test_query_ranking():
     """Verify ranking returns the most relevant result first."""
     cleanup()
-    server.memory_store("The database password is stored in .env", scope=SCOPE)
-    server.memory_store("Favorite color is green", scope=SCOPE)
-    server.memory_store("Database runs on PostgreSQL 15 on port 5432", scope=SCOPE)
-    result = server.memory_query("database setup", scope=SCOPE, limit=2)
+    tools.memory_store("The database password is stored in .env", scope=SCOPE)
+    tools.memory_store("Favorite color is green", scope=SCOPE)
+    tools.memory_store("Database runs on PostgreSQL 15 on port 5432", scope=SCOPE)
+    result = tools.memory_query("database setup", scope=SCOPE, limit=2)
     lines = result.split("\n")
     # First result should mention database/PostgreSQL, not color
     first_result = next((l for l in lines if "(" in l and "/" in l), "")
@@ -203,9 +221,11 @@ def test_query_ranking():
 def test_list_basic():
     """List memories in a scope."""
     cleanup()
-    server.memory_store("The build tool is webpack 5 with babel", scope=SCOPE)
-    server.memory_store("The CI pipeline runs on GitHub Actions with Node 20", scope=SCOPE)
-    result = server.memory_list(scope=SCOPE)
+    tools.memory_store("The build tool is webpack 5 with babel", scope=SCOPE)
+    tools.memory_store(
+        "The CI pipeline runs on GitHub Actions with Node 20", scope=SCOPE
+    )
+    result = tools.memory_list(scope=SCOPE)
     if "memories" in result and "No memories" not in result:
         ok(f"list_basic ({result.split(chr(10))[0]})")
     else:
@@ -214,7 +234,7 @@ def test_list_basic():
 
 def test_list_with_category_filter():
     """List with category filter."""
-    result = server.memory_list(scope=SCOPE, category="user_preference")
+    result = tools.memory_list(scope=SCOPE, category="user_preference")
     # Should return 0 or more — just verify it doesn't error
     if "memories" in result or "No memories" in result:
         ok("list_with_category_filter")
@@ -225,18 +245,20 @@ def test_list_with_category_filter():
 def test_forget():
     """Store a memory then delete it."""
     cleanup()
-    result = server.memory_store("Temporary test memory to delete", scope=SCOPE)
+    result = tools.memory_store("Temporary test memory to delete", scope=SCOPE)
     # Extract ID from result
     mem_id = result.split(" ")[2] if "Stored" in result else None
     if not mem_id:
         fail("forget", f"Couldn't extract ID from: {result}")
         return
     short_id = mem_id[:8]
-    del_result = server.memory_forget(short_id)
+    del_result = tools.memory_forget(short_id)
     if "Deleted" in del_result:
         # Verify it's gone
-        conn = server.get_db()
-        count = conn.execute("SELECT COUNT(*) as c FROM memories WHERE id = ?", (mem_id,)).fetchone()["c"]
+        conn = db.get_db()
+        count = conn.execute(
+            "SELECT COUNT(*) as c FROM memories WHERE id = ?", (mem_id,)
+        ).fetchone()["c"]
         conn.close()
         if count == 0:
             ok("forget")
@@ -248,7 +270,7 @@ def test_forget():
 
 def test_forget_nonexistent():
     """Forget a memory that doesn't exist."""
-    result = server.memory_forget("00000000-0000-0000-0000-000000000000")
+    result = tools.memory_forget("00000000-0000-0000-0000-000000000000")
     if "No memory found" in result or "Deleted" in result:
         ok("forget_nonexistent")
     else:
@@ -258,10 +280,10 @@ def test_forget_nonexistent():
 def test_consolidate():
     """Store duplicate-ish memories and consolidate."""
     cleanup()
-    server.memory_store("Node.js version 20 is installed", scope=SCOPE)
-    server.memory_store("Node version is 20 LTS", scope=SCOPE)
-    server.memory_store("npm version 10.2 is available", scope=SCOPE)
-    result = server.memory_consolidate(SCOPE)
+    tools.memory_store("Node.js version 20 is installed", scope=SCOPE)
+    tools.memory_store("Node version is 20 LTS", scope=SCOPE)
+    tools.memory_store("npm version 10.2 is available", scope=SCOPE)
+    result = tools.memory_consolidate(SCOPE)
     # Consolidation should either merge or report clean
     if "actions applied" in result or "clean" in result or "Consolidated" in result:
         ok(f"consolidate ({result[:100]})")
@@ -271,7 +293,7 @@ def test_consolidate():
 
 def test_consolidate_empty():
     """Consolidate an empty scope."""
-    result = server.memory_consolidate("__empty_consolidate__")
+    result = tools.memory_consolidate("__empty_consolidate__")
     if "No memories" in result:
         ok("consolidate_empty")
     else:
@@ -281,8 +303,8 @@ def test_consolidate_empty():
 def test_scoping():
     """Memories in one scope don't appear in another."""
     cleanup()
-    server.memory_store("Scoped to test", scope=SCOPE)
-    result = server.memory_list(scope="__other_scope__")
+    tools.memory_store("Scoped to test", scope=SCOPE)
+    result = tools.memory_list(scope="__other_scope__")
     if "No memories" in result:
         ok("scoping")
     else:
@@ -291,14 +313,14 @@ def test_scoping():
 
 if __name__ == "__main__":
     print(f"\nMemory Agent Integration Tests")
-    print(f"Model: {server.OLLAMA_MODEL} @ {server.OLLAMA_URL}")
+    print(f"Model: {llm.BEDROCK_MODEL} @ Bedrock ({llm.AWS_REGION})")
     print(f"Test DB: {TEST_DB}")
     print(f"{'=' * 50}\n")
 
     cleanup()
 
     tests = [
-        test_ollama_reachable,
+        test_bedrock_reachable,
         test_llm_returns_json,
         test_store_basic,
         test_store_categorization,
