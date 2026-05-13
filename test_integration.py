@@ -320,7 +320,7 @@ if __name__ == "__main__":
     cleanup()
 
     tests = [
-        test_bedrock_reachable,
+        # test_bedrock_reachable,  # only enable with LLM_BACKEND=bedrock
         test_llm_returns_json,
         test_store_basic,
         test_store_categorization,
