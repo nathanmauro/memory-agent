@@ -1,27 +1,58 @@
-"""LLM helpers for the memory agent (Amazon Bedrock / Claude Haiku)."""
+"""LLM helpers for the memory agent. Supports Ollama and Amazon Bedrock backends."""
 
 import json
 import os
-
-import boto3
+import urllib.request
 
 from models import MemoryMetadata, MemoryRecord
+
+LLM_BACKEND = os.environ.get("LLM_BACKEND", "ollama")
+
+OLLAMA_URL = os.environ.get("OLLAMA_URL", "http://localhost:11434")
+OLLAMA_MODEL = os.environ.get("OLLAMA_MODEL", "qwen2.5:14b")
 
 AWS_REGION = os.environ.get("AWS_REGION", "us-east-1")
 BEDROCK_MODEL = os.environ.get(
     "BEDROCK_MODEL", "us.anthropic.claude-3-5-haiku-20241022-v1:0"
 )
 
-_profile = os.environ.get("AWS_PROFILE")
-if _profile:
-    _session = boto3.Session(profile_name=_profile, region_name=AWS_REGION)
-else:
-    _session = boto3.Session(region_name=AWS_REGION)
-bedrock = _session.client("bedrock-runtime")
+_bedrock_client = None
 
 
-def llm_call(system: str, user: str) -> str:
-    response = bedrock.converse(
+def _get_bedrock():
+    global _bedrock_client
+    if _bedrock_client is None:
+        import boto3
+
+        profile = os.environ.get("AWS_PROFILE")
+        session = (
+            boto3.Session(profile_name=profile, region_name=AWS_REGION)
+            if profile
+            else boto3.Session(region_name=AWS_REGION)
+        )
+        _bedrock_client = session.client("bedrock-runtime")
+    return _bedrock_client
+
+
+def _ollama_call(system: str, user: str) -> str:
+    payload = json.dumps({
+        "model": OLLAMA_MODEL,
+        "prompt": f"{system}\n\n{user}",
+        "stream": False,
+        "options": {"temperature": 0.1, "num_predict": 1024},
+    }).encode()
+    req = urllib.request.Request(
+        f"{OLLAMA_URL}/api/generate",
+        data=payload,
+        headers={"Content-Type": "application/json"},
+    )
+    with urllib.request.urlopen(req, timeout=120) as resp:
+        return json.loads(resp.read().decode())["response"]
+
+
+def _bedrock_call(system: str, user: str) -> str:
+    client = _get_bedrock()
+    response = client.converse(
         modelId=BEDROCK_MODEL,
         system=[{"text": system}],
         messages=[
@@ -33,6 +64,12 @@ def llm_call(system: str, user: str) -> str:
         },
     )
     return response["output"]["message"]["content"][0]["text"]
+
+
+def llm_call(system: str, user: str) -> str:
+    if LLM_BACKEND == "bedrock":
+        return _bedrock_call(system, user)
+    return _ollama_call(system, user)
 
 
 def extract_json_object(raw: str) -> dict:
