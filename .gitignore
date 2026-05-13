@@ -2,3 +2,6 @@ __pycache__/
 *.pyc
 .env
 .idea/
+.venv/
+run_server.sh
+memory_test.db*
