@@ -1,7 +1,10 @@
 __pycache__/
 *.pyc
+*.patch
 .env
 .idea/
 .venv/
 run_server.sh
 memory_test.db*
+.claude-trace/
+

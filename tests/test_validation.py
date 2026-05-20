@@ -1,0 +1,322 @@
+"""
+Local validation tests for pydantic-backed parsing and cleanup helpers.
+Run: python -m tests.test_validation  (or `pytest tests/test_validation.py`)
+"""
+
+import json
+import os
+import shutil
+import tempfile
+from datetime import datetime, timedelta, timezone
+
+from mcp_memory_agent import db, hook_handler, llm, tools
+
+PASS = 0
+FAIL = 0
+TEST_ROOT = os.path.join(tempfile.gettempdir(), "memory_validation_test")
+TEST_DB = os.path.join(TEST_ROOT, "memory.db")
+TEST_SESSIONS = os.path.join(TEST_ROOT, "sessions")
+ORIGINAL_DB_PATH = db.DB_PATH
+ORIGINAL_SESSIONS_DIR = db.SESSIONS_DIR
+ORIGINAL_LLM_CALL = llm.llm_call
+
+
+def ok(name: str) -> None:
+    global PASS
+    PASS += 1
+    print(f"  PASS  {name}")
+
+
+def fail(name: str, reason: str) -> None:
+    global FAIL
+    FAIL += 1
+    print(f"  FAIL  {name}: {reason}")
+
+
+def reset_db() -> None:
+    shutil.rmtree(TEST_ROOT, ignore_errors=True)
+    os.makedirs(TEST_ROOT, exist_ok=True)
+    db.DB_PATH = TEST_DB
+    db.SESSIONS_DIR = TEST_SESSIONS
+    db.init_db()
+
+
+def restore_state() -> None:
+    db.DB_PATH = ORIGINAL_DB_PATH
+    db.SESSIONS_DIR = ORIGINAL_SESSIONS_DIR
+    llm.llm_call = ORIGINAL_LLM_CALL
+    shutil.rmtree(TEST_ROOT, ignore_errors=True)
+
+
+def insert_memory(
+    mem_id: str,
+    content: str,
+    scope: str = "__validation__",
+    category: str = "project_knowledge",
+    importance: int = 3,
+    updated_at: str = "",
+) -> None:
+    now = updated_at or datetime.now(timezone.utc).isoformat()
+    conn = db.get_db()
+    conn.execute(
+        "INSERT INTO memories (id, content, category, scope, tags, created_at, updated_at, source, importance) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (mem_id, content, category, scope, "", now, now, "test", importance),
+    )
+    conn.commit()
+    conn.close()
+
+
+def test_extract_memory_metadata_defaults() -> None:
+    llm.llm_call = lambda system, user: "not json"
+    meta = llm.extract_memory_metadata("test", "global", [])
+    if (
+        meta.category == "project_knowledge"
+        and meta.importance == 3
+        and meta.tags == ""
+    ):
+        ok("extract_memory_metadata_defaults")
+    else:
+        fail(
+            "extract_memory_metadata_defaults",
+            f"Unexpected metadata: {meta.model_dump()}",
+        )
+
+
+def test_extract_memory_metadata_normalizes_values() -> None:
+    payload = {
+        "category": "USER_PREFERENCE",
+        "tags": " Python, python, AWS ",
+        "importance": 99,
+        "merge_with_id": "abc123",
+        "merged_content": "   ",
+    }
+    llm.llm_call = lambda system, user: json.dumps(payload)
+    meta = llm.extract_memory_metadata("test", "global", [])
+    if (
+        meta.category == "user_preference"
+        and meta.tags == "python,aws"
+        and meta.importance == 5
+    ):
+        if meta.merge_with_id is None and meta.merged_content is None:
+            ok("extract_memory_metadata_normalizes_values")
+            return
+    fail(
+        "extract_memory_metadata_normalizes_values",
+        f"Unexpected metadata: {meta.model_dump()}",
+    )
+
+
+def test_memory_query_clamps_limit() -> None:
+    reset_db()
+    for idx in range(3):
+        insert_memory(
+            f"00000000-0000-0000-0000-00000000000{idx}", f"database memory {idx}"
+        )
+    result = tools.memory_query("database", scope="__validation__", limit=0)
+    if result.startswith("Found 1 memories"):
+        ok("memory_query_clamps_limit")
+    else:
+        fail("memory_query_clamps_limit", f"Unexpected result: {result}")
+
+
+def test_memory_consolidate_ignores_invalid_actions() -> None:
+    reset_db()
+    insert_memory("11111111-1111-1111-1111-111111111111", "old content")
+    payload = {
+        "actions": [
+            {"type": "noop", "id": "11111111-1111-1111-1111-111111111111"},
+            {
+                "type": "update",
+                "id": "11111111-1111-1111-1111-111111111111",
+                "new_content": "new content",
+            },
+        ],
+        "summary": "updated one memory",
+    }
+    llm.llm_call = lambda system, user: json.dumps(payload)
+    result = tools.memory_consolidate("__validation__")
+    conn = db.get_db()
+    row = conn.execute(
+        "SELECT content FROM memories WHERE id = ?",
+        ("11111111-1111-1111-1111-111111111111",),
+    ).fetchone()
+    conn.close()
+    if "1 actions applied" in result and row and row["content"] == "new content":
+        ok("memory_consolidate_ignores_invalid_actions")
+    else:
+        fail(
+            "memory_consolidate_ignores_invalid_actions", f"Unexpected result: {result}"
+        )
+
+
+def test_memory_index_no_llm_call() -> None:
+    reset_db()
+    insert_memory("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa", "database migration plan")
+    insert_memory("bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb", "database indexes notes")
+    calls = {"count": 0}
+
+    def spy(system, user):
+        calls["count"] += 1
+        return ""
+
+    llm.llm_call = spy
+    result = tools.memory_index("database", scope="__validation__", limit=5)
+    if calls["count"] == 0 and "2 hits" in result and "aaaaaaaa" in result:
+        ok("memory_index_no_llm_call")
+    else:
+        fail(
+            "memory_index_no_llm_call",
+            f"calls={calls['count']} result={result[:120]}",
+        )
+
+
+def test_memory_get_full_and_prefix() -> None:
+    reset_db()
+    full_id = "cccccccc-cccc-cccc-cccc-cccccccccccc"
+    insert_memory(full_id, "hello world")
+    by_full = tools.memory_get([full_id])
+    by_prefix = tools.memory_get(["cccccccc"])
+    by_missing = tools.memory_get(["deadbeef"])
+    if (
+        "hello world" in by_full
+        and "hello world" in by_prefix
+        and by_missing == "No memories found."
+    ):
+        ok("memory_get_full_and_prefix")
+    else:
+        fail(
+            "memory_get_full_and_prefix",
+            f"full={by_full[:80]} prefix={by_prefix[:80]} missing={by_missing!r}",
+        )
+
+
+def test_memory_timeline_orders_and_filters() -> None:
+    reset_db()
+    base = datetime(2026, 5, 1, tzinfo=timezone.utc)
+    for idx in range(3):
+        ts = (base + timedelta(days=idx)).isoformat()
+        insert_memory(
+            f"dddddddd-dddd-dddd-dddd-dddddddddd0{idx}",
+            f"event {idx}",
+            updated_at=ts,
+        )
+    insert_memory(
+        "eeeeeeee-eeee-eeee-eeee-eeeeeeeeeeee",
+        "other-scope event",
+        scope="__other__",
+        updated_at=(base + timedelta(days=10)).isoformat(),
+    )
+    desc = tools.memory_timeline(scope="__validation__", limit=10)
+    asc = tools.memory_timeline(
+        scope="__validation__",
+        after_iso=(base - timedelta(days=1)).isoformat(),
+        limit=10,
+    )
+    cross_scope = tools.memory_timeline(limit=10)
+
+    desc_lines = desc.splitlines()
+    asc_lines = asc.splitlines()
+    desc_order_ok = desc_lines.index("  event 2") < desc_lines.index("  event 0")
+    asc_order_ok = asc_lines.index("  event 0") < asc_lines.index("  event 2")
+    scope_isolated = "other-scope event" not in desc
+    cross_scope_includes = "other-scope event" in cross_scope
+
+    if desc_order_ok and asc_order_ok and scope_isolated and cross_scope_includes:
+        ok("memory_timeline_orders_and_filters")
+    else:
+        fail(
+            "memory_timeline_orders_and_filters",
+            f"desc_ok={desc_order_ok} asc_ok={asc_order_ok} "
+            f"isolated={scope_isolated} cross={cross_scope_includes}",
+        )
+
+
+def test_hook_summarize_inserts_memory() -> None:
+    reset_db()
+    session_id = "test-session-001"
+    buffer_path = os.path.join(db.SESSIONS_DIR, f"{session_id}.jsonl")
+    os.makedirs(db.SESSIONS_DIR, exist_ok=True)
+    with open(buffer_path, "w") as f:
+        for i in range(4):
+            event = {
+                "ts": datetime.now(timezone.utc).isoformat(),
+                "kind": "prompt" if i % 2 == 0 else "tool_use",
+                "scope": "__validation__",
+                "data": {"prompt": f"do thing {i}"}
+                if i % 2 == 0
+                else {"tool_name": "Bash", "tool_input": {"cmd": f"cmd {i}"}},
+            }
+            f.write(json.dumps(event) + "\n")
+
+    summary_payload = {
+        "session_summary": "User implemented hook auto-capture",
+        "memories": ["Use SQLite + FTS5, no embeddings"],
+    }
+    llm.llm_call = lambda system, user: json.dumps(summary_payload)
+
+    hook_handler._summarize_buffer(buffer_path, fallback_scope="__validation__")
+
+    buffer_gone = not os.path.exists(buffer_path)
+    conn = db.get_db()
+    rows = conn.execute(
+        "SELECT content FROM memories WHERE scope = ? ORDER BY content",
+        ("__validation__",),
+    ).fetchall()
+    conn.close()
+    contents = [r["content"] for r in rows]
+
+    if (
+        buffer_gone
+        and "User implemented hook auto-capture" in contents
+        and "Use SQLite + FTS5, no embeddings" in contents
+    ):
+        ok("hook_summarize_inserts_memory")
+    else:
+        fail(
+            "hook_summarize_inserts_memory",
+            f"buffer_gone={buffer_gone} contents={contents}",
+        )
+
+
+def test_hook_summarize_skips_short_buffer() -> None:
+    reset_db()
+    session_id = "test-session-002"
+    buffer_path = os.path.join(db.SESSIONS_DIR, f"{session_id}.jsonl")
+    os.makedirs(db.SESSIONS_DIR, exist_ok=True)
+    with open(buffer_path, "w") as f:
+        f.write(
+            json.dumps({"ts": "x", "kind": "prompt", "scope": "x", "data": {}}) + "\n"
+        )
+    calls = {"count": 0}
+    llm.llm_call = lambda s, u: (calls.update(count=calls["count"] + 1) or "{}")
+
+    hook_handler._summarize_buffer(buffer_path, fallback_scope="__validation__")
+
+    conn = db.get_db()
+    n = conn.execute("SELECT COUNT(*) AS n FROM memories").fetchone()["n"]
+    conn.close()
+    if calls["count"] == 0 and not os.path.exists(buffer_path) and n == 0:
+        ok("hook_summarize_skips_short_buffer")
+    else:
+        fail(
+            "hook_summarize_skips_short_buffer",
+            f"calls={calls['count']} buffer={os.path.exists(buffer_path)} rows={n}",
+        )
+
+
+if __name__ == "__main__":
+    try:
+        test_extract_memory_metadata_defaults()
+        test_extract_memory_metadata_normalizes_values()
+        test_memory_query_clamps_limit()
+        test_memory_consolidate_ignores_invalid_actions()
+        test_memory_index_no_llm_call()
+        test_memory_get_full_and_prefix()
+        test_memory_timeline_orders_and_filters()
+        test_hook_summarize_inserts_memory()
+        test_hook_summarize_skips_short_buffer()
+    finally:
+        restore_state()
+
+    print(f"\nResults: {PASS} passed, {FAIL} failed out of {PASS + FAIL}")
+    raise SystemExit(1 if FAIL > 0 else 0)

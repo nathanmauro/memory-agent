@@ -4,7 +4,7 @@ import sqlite3
 
 from pydantic import BaseModel, model_validator
 
-from models.types import Category, Importance, OptionalText, Tags
+from .types import Category, Importance, OptionalText, Tags
 
 
 class MemoryRecord(BaseModel):

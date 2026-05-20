@@ -71,6 +71,24 @@ def _clamp(low: int, high: int, default: int):
     return validator
 
 
+def _normalize_id_list(value: object) -> list[str]:
+    if isinstance(value, str):
+        value = [value]
+    if not isinstance(value, list):
+        return []
+    out = []
+    seen = set()
+    for item in value[:50]:
+        if not isinstance(item, str):
+            continue
+        item = item.strip()
+        if not item or item in seen:
+            continue
+        seen.add(item)
+        out.append(item)
+    return out
+
+
 # --- Annotated types ---
 
 StrippedText = Annotated[str, BeforeValidator(_strip_text)]
@@ -80,3 +98,4 @@ Tags = Annotated[str, BeforeValidator(_normalize_tags)]
 Importance = Annotated[int, BeforeValidator(_normalize_importance)]
 QueryLimit = Annotated[int, BeforeValidator(_clamp(1, 50, 10))]
 ListLimit = Annotated[int, BeforeValidator(_clamp(1, 100, 20))]
+IdList = Annotated[list[str], BeforeValidator(_normalize_id_list)]

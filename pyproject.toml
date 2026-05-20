@@ -1,0 +1,59 @@
+[build-system]
+requires = ["hatchling>=1.21"]
+build-backend = "hatchling.build"
+
+[project]
+name = "mcp-memory-agent"
+version = "0.2.0.dev0"
+description = "Persistent structured memory MCP server for Claude Code with pluggable substrate routers (SQLite, Logseq, Notion)."
+readme = "README.md"
+requires-python = ">=3.11"
+license = "MIT"
+authors = [{ name = "Nathan Mauro" }]
+keywords = ["mcp", "claude", "memory", "agent", "notion", "logseq", "para"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+]
+dependencies = [
+    "mcp>=1.0",
+    "pydantic>=2.0",
+]
+
+[project.optional-dependencies]
+notion = ["notion-client>=2.2"]
+bedrock = ["boto3>=1.34"]
+dev = [
+    "pytest>=8.0",
+    "ruff>=0.5",
+]
+
+[project.scripts]
+mcp-memory-agent-server = "mcp_memory_agent.server:main"
+mcp-memory-agent-hook = "mcp_memory_agent.hook_handler:main"
+mcp-memory-agent-install = "mcp_memory_agent.install:main"
+
+[project.urls]
+Homepage = "https://github.com/nathanmauro/mcp-memory-agent"
+Issues = "https://github.com/nathanmauro/mcp-memory-agent/issues"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/mcp_memory_agent"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+addopts = "-q"
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "W", "UP"]
+ignore = ["E501"]

@@ -34,12 +34,15 @@ The codebase is small and procedural; `models/` is the only package.
 | File / Dir                | Role                                                          |
 |---------------------------|---------------------------------------------------------------|
 | `server.py`               | Entry point: `db.init_db()` then `mcp.run()`.                 |
-| `tools.py`                | `FastMCP` app + 5 `@mcp.tool()` handlers.                     |
-| `db.py`                   | SQLite path/init, FTS upsert/delete, query-term extraction.   |
+| `tools.py`                | `FastMCP` app + 8 `@mcp.tool()` handlers, plus `_insert_memory` / `_gather_candidates` shared helpers. |
+| `db.py`                   | SQLite path/init, FTS upsert/delete, query-term extraction, `SESSIONS_DIR`, `resolve_memory_id`, `iter_session_buffers`. |
 | `llm.py`                  | LLM dispatch (Ollama / Bedrock), JSON extraction, ranking.    |
+| `hook_handler.py`         | Claude Code hook entrypoint: `inject-context`, `record`, `summarize-session`, `sweep`. Always exits 0. |
+| `hooks/*.sh`              | Thin shell wrappers wired into `~/.claude/settings.json` by `install.py`. |
+| `install.py`              | Idempotent installer: `claude mcp add -s user memory …` + merges hook entries into `~/.claude/settings.json` (with `.bak`). |
 | `models/`                 | Pydantic models + reusable `Annotated` validators.            |
 | `test_integration.py`     | Live-LLM tests, isolated to `memory_test.db` + `__test__` scope. |
-| `test_validation.py`      | Local tests; mocks `llm.llm_call`, uses tempdir DB.           |
+| `test_validation.py`      | Local tests; mocks `llm.llm_call`, uses tempdir DB + sessions dir. |
 
 ### LLM backend
 
@@ -58,11 +61,24 @@ Tests patch `db.DB_PATH` before calling `db.init_db()` to redirect to a test DB.
 
 ### Data flow
 
-- **`memory_store`** — load up to 30 most-recent memories in scope, ask LLM for `{category, tags, importance, merge_with_id?, merged_content?}`. If a merge is suggested, `UPDATE` the existing row; otherwise `INSERT` a new UUID. Both paths upsert into FTS.
-- **`memory_query`** — FTS5 MATCH first (terms extracted via `extract_search_terms`, stop words filtered, punctuation stripped to avoid MATCH syntax errors). If FTS returns < 5 rows, supplement with a LIKE fallback. Candidates are then re-ranked by the LLM (`rank_memories`) and truncated to `limit`.
+- **`memory_store`** — load up to 30 most-recent memories in scope, ask LLM for `{category, tags, importance, merge_with_id?, merged_content?}`. If a merge is suggested, `UPDATE` the existing row; otherwise `INSERT` a new UUID. Both paths upsert into FTS. The body lives in `tools._insert_memory` so `hook_handler` shares it.
+- **`memory_query`** — `tools._gather_candidates` runs FTS5 MATCH first (terms extracted via `extract_search_terms`, stop words filtered, punctuation stripped to avoid MATCH syntax errors). If FTS returns < 5 rows, supplement with a LIKE fallback. Candidates are then re-ranked by the LLM (`rank_memories`) and truncated to `limit`.
+- **`memory_index`** — same `_gather_candidates` flow as `memory_query` but **no** LLM rerank. Returns one compact line per hit (id8, category, importance, tags, snippet). Use to scan many candidates cheaply.
+- **`memory_get`** — accepts a list of full UUIDs or 8-char prefixes (each resolved via `db.resolve_memory_id`). Returns full `MemoryRecord.format()` for each found id.
 - **`memory_list`** — pure DB query, no LLM.
+- **`memory_timeline`** — pure DB query ordered by `updated_at`. Bounded optionally by `before_iso` / `after_iso`. Switches to ASC ordering when `after_iso` is set.
 - **`memory_forget`** — accepts full UUID or first-8-char prefix; deletes from both tables.
 - **`memory_consolidate`** — load all memories in a scope, ask LLM for `{actions: [merge|delete|update], summary}`, apply each action best-effort (per-action `try/except` so one bad action can't abort the batch).
+
+### Auto-capture flow (Claude Code hooks)
+
+`install.py` registers four entries in `~/.claude/settings.json`:
+
+- **`SessionStart` → `hook_handler.py inject-context`** — derives scope from `cwd` (basename of nearest `.git` toplevel, else basename of cwd, else `global`), reads top 3 by `(importance, updated_at) DESC` plus the next 5 most-recent unique IDs, prints them as a `hookSpecificOutput.additionalContext` bullet list. No LLM call. Also calls `_sweep()` before returning so SessionEnd misses don't strand buffers forever.
+- **`UserPromptSubmit` / `PostToolUse` → `hook_handler.py record --kind …`** — append a JSON line to `~/.claude/memory/sessions/<session_id>.jsonl`. Each `data` field is truncated to 500 bytes. Dumb, fast, no LLM.
+- **`SessionEnd` → `hook_handler.py summarize-session`** — read the buffer, skip if `< 3` records, otherwise call LLM with the transcript, parse `{session_summary, memories[]}`, and insert each via `tools._insert_memory` (so dedup/merge still applies). Delete the buffer.
+
+Every hook script ends with `exit 0`, and the Python entry wraps `main()` in `try/except Exception: pass` — a memory-agent fault cannot break a Claude Code session.
 
 ### Schema
 
@@ -78,6 +94,6 @@ Tests patch `db.DB_PATH` before calling `db.init_db()` to redirect to a test DB.
 
 ## Known Quirks
 
-- `setup.py` is stale — it prompts for an Anthropic API key and writes to `~/.claude/settings.json`, but the server now uses Ollama or Bedrock and is registered in `~/.mcp.json`. Don't run it; it does not match the current architecture.
-- The design doc under `docs/superpowers/specs/` predates the Ollama backend.
+- The design doc under `docs/superpowers/specs/` predates the Ollama backend and the hook-based auto-capture.
 - FTS query terms are stripped of punctuation and short/stop words before being joined with `OR` — anything shorter than 3 chars or in `db.STOP_WORDS` is dropped.
+- `hook_handler.py` reuses `tools._insert_memory`, which calls `llm.extract_memory_metadata`. If Ollama is down during SessionEnd, the LLM call returns empty, the summarizer logs nothing, and the session buffer is removed anyway — by design, so the buffer dir doesn't grow unbounded.

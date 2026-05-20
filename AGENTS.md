@@ -11,26 +11,33 @@ Pydantic models for validation; otherwise procedural.
 | File / Directory          | Purpose                                                      |
 |---------------------------|--------------------------------------------------------------|
 | `server.py`               | Entry point: calls `init_db()`, runs `mcp.run()`            |
-| `tools.py`                | MCP `FastMCP` app + 5 `@mcp.tool()` functions               |
-| `db.py`                   | DB config, `get_db`, `init_db`, FTS/query helpers            |
-| `llm.py`                  | AWS/Bedrock client, `llm_call`, JSON extractors, ranking     |
+| `tools.py`                | MCP `FastMCP` app + 8 `@mcp.tool()` functions               |
+| `db.py`                   | DB config, `get_db`, `init_db`, FTS/query helpers, `SESSIONS_DIR`, `resolve_memory_id`, `iter_session_buffers` |
+| `llm.py`                  | LLM dispatch (Ollama / Bedrock), JSON extractors, ranking    |
+| `hook_handler.py`         | CLI entry for Claude Code hooks (`inject-context`, `record`, `summarize-session`, `sweep`); always exits 0 |
+| `hooks/`                  | Thin shell wrappers (`session_start.sh`, `user_prompt_submit.sh`, `post_tool_use.sh`, `session_end.sh`) |
+| `install.py`              | Idempotent one-shot: `claude mcp add` + merge hook entries into `~/.claude/settings.json` |
 | `models/`                 | Pydantic models package                                      |
 | `models/types.py`         | Reusable validators + `Annotated` type aliases               |
 | `models/memory.py`        | `MemoryRecord`, `MemoryMetadata`                             |
-| `models/options.py`       | `MemoryQueryOptions`, `MemoryListOptions`                    |
+| `models/options.py`       | `MemoryQueryOptions`, `MemoryListOptions`, `MemoryIndexOptions`, `MemoryGetOptions`, `MemoryTimelineOptions` |
 | `models/consolidation.py` | `ConsolidationAction`, `ConsolidationResult`                 |
-| `setup.py`                | One-time interactive setup (API key + MCP registration)      |
-| `test_integration.py`     | Integration tests (requires Bedrock access)                  |
-| `test_validation.py`      | Local validation tests (no Bedrock needed)                   |
+| `test_integration.py`     | Integration tests (live LLM)                                 |
+| `test_validation.py`      | Local validation tests (mocked LLM)                          |
 | `docs/`                   | Design specs                                                 |
+
+Transient state:
+
+- `~/.claude/memory/memory.db` — persistent SQLite store.
+- `~/.claude/memory/sessions/<session_id>.jsonl` — per-session transcript buffer. Written by `UserPromptSubmit` + `PostToolUse` hooks; consumed and deleted by `SessionEnd` (or, on miss, by the `SessionStart` sweep ≥1 hour later).
 
 ## Dependencies
 
-Only two third-party packages: `mcp` (MCP Python SDK) and `boto3` (AWS SDK).
-No `requirements.txt` or `pyproject.toml`. Install with:
+Two third-party packages: `mcp` (MCP Python SDK) and `pydantic`. `boto3` only if using the Bedrock backend. No `requirements.txt` or `pyproject.toml`. Install with:
 
 ```sh
-pip install mcp boto3
+pip install "mcp[cli]" pydantic
+# optional: pip install boto3
 ```
 
 ## Build / Run / Test Commands
@@ -39,16 +46,16 @@ pip install mcp boto3
 # Run the MCP server (no build step)
 python server.py
 
-# Run one-time setup (interactive — registers with Claude Code)
-python setup.py
+# Idempotent install: registers MCP server + writes hook entries
+python install.py
 
-# Run ALL integration tests (requires AWS/Bedrock credentials)
+# Run ALL integration tests (live LLM — defaults to Ollama, set LLM_BACKEND=bedrock for AWS)
 python test_integration.py
 
-# Run local validation tests (no Bedrock needed)
+# Run local validation tests (mocks the LLM; no network)
 python test_validation.py
 
-# Run a SINGLE test — edit test_integration.py:
+# Run a SINGLE integration test — edit test_integration.py:
 #   1. Find the `tests = [...]` list near line 301
 #   2. Replace with a single-element list, e.g.: tests = [test_store_basic]
 #   3. Run: python test_integration.py
@@ -60,10 +67,10 @@ Follow PEP 8 conventions manually.
 ## Key Infrastructure
 
 - **Database:** SQLite with FTS5 (optional — degrades gracefully)
-- **LLM:** Amazon Bedrock, model `us.anthropic.claude-3-5-haiku-20241022-v1:0`
-- **Auth:** AWS credentials via `~/.aws/credentials` (or `AWS_PROFILE` env var)
-- **Config:** `AWS_REGION` (default `us-east-1`), `BEDROCK_MODEL` env vars
-- **MCP tools:** `memory_store`, `memory_query`, `memory_list`, `memory_forget`, `memory_consolidate`
+- **LLM:** Ollama (default, `qwen2.5:14b`) or Amazon Bedrock (`us.anthropic.claude-3-5-haiku-20241022-v1:0`) via `LLM_BACKEND` env
+- **Auth:** none for Ollama; AWS credentials via `~/.aws/credentials` or `AWS_PROFILE` for Bedrock
+- **Config:** `OLLAMA_URL`, `OLLAMA_MODEL`, `LLM_BACKEND`, `AWS_REGION`, `BEDROCK_MODEL`
+- **MCP tools:** `memory_store`, `memory_query`, `memory_index`, `memory_get`, `memory_list`, `memory_timeline`, `memory_forget`, `memory_consolidate`
 
 ## Code Style
 
@@ -154,9 +161,10 @@ except sqlite3.OperationalError:
 | `models/memory.py`   | `MemoryRecord`, `MemoryMetadata`                            |
 | `models/options.py`  | `MemoryQueryOptions`, `MemoryListOptions`                   |
 | `models/consolidation.py` | `ConsolidationAction`, `ConsolidationResult`           |
-| `db.py`              | `DB_DIR`, `DB_PATH`, `STOP_WORDS`, all DB helpers           |
-| `llm.py`             | `AWS_REGION`, `BEDROCK_MODEL`, `bedrock`, all LLM helpers   |
-| `tools.py`           | `mcp` (FastMCP app), all `@mcp.tool()` functions            |
+| `db.py`              | `DB_DIR`, `DB_PATH`, `SESSIONS_DIR`, `STOP_WORDS`, all DB helpers, session-buffer iteration |
+| `llm.py`             | `LLM_BACKEND`, Ollama + Bedrock dispatch, `llm_call`, JSON extractors, ranking |
+| `tools.py`           | `mcp` (FastMCP app), all `@mcp.tool()` functions, `_insert_memory`, `_gather_candidates` |
+| `hook_handler.py`    | All Claude Code lifecycle handling; reuses `tools._insert_memory` so dedup/merge stays consistent |
 | `server.py`          | Entry point only: `init_db()` + `mcp.run()`                 |
 
 ### Data Patterns

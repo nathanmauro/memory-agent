@@ -4,7 +4,7 @@ import json
 import os
 import urllib.request
 
-from models import MemoryMetadata, MemoryRecord
+from .models import MemoryMetadata, MemoryRecord
 
 LLM_BACKEND = os.environ.get("LLM_BACKEND", "ollama")
 

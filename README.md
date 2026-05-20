@@ -4,13 +4,16 @@ An [MCP](https://modelcontextprotocol.io) server that gives Claude Code (or any 
 
 ## What it does
 
-Exposes five tools to the MCP client:
+Exposes eight tools to the MCP client:
 
 | Tool | Purpose |
 |---|---|
 | `memory_store` | Persist a memory; LLM picks category, tags, importance; merges with an existing memory when content overlaps. |
 | `memory_query` | FTS5 search over content + tags, supplemented by a LIKE fallback, then re-ranked by the LLM. |
+| `memory_index` | Same candidate gathering as `memory_query` but no LLM rerank — one compact line per hit, cheap to scan. |
+| `memory_get` | Fetch full content for one or more IDs (full UUID or 8-char prefix). Use after `memory_index`. |
 | `memory_list` | Pure DB listing, filterable by scope + category. No LLM call. |
+| `memory_timeline` | DB-only chronological view, optionally bounded by `before_iso` / `after_iso`. |
 | `memory_forget` | Delete a memory by full UUID or 8-char prefix. |
 | `memory_consolidate` | Ask the LLM to propose merge/delete/update actions over a scope's memories; applied best-effort. |
 
@@ -55,28 +58,34 @@ For Ollama: install [Ollama](https://ollama.com) and pull a model, e.g.:
 ollama pull gemma4:26b
 ```
 
-## Register with Claude Code
+## Install
+
+One command registers the MCP server and writes the hook entries to `~/.claude/settings.json` (backed up to `settings.json.bak`):
 
 ```bash
-claude mcp add -s user memory /absolute/path/to/.venv/bin/python -- /absolute/path/to/server.py
+.venv/bin/python install.py
 ```
 
-To inject env vars (e.g. selecting a different Ollama model), the easiest path is a small wrapper script and pointing the MCP entry at that:
+The install is idempotent — re-running leaves existing entries alone. After it finishes, restart Claude Code; the eight tools appear under `mcp__memory__*` and the auto-capture hooks below start firing.
 
-```bash
-#!/usr/bin/env bash
-set -euo pipefail
-cd "$(dirname "$0")"
-export OLLAMA_MODEL="${OLLAMA_MODEL:-gemma4:26b}"
-export LLM_BACKEND="${LLM_BACKEND:-ollama}"
-exec ./.venv/bin/python server.py
-```
+If you'd rather register the MCP server by hand, the wrapper script in `run_server.sh` honors `OLLAMA_MODEL` / `OLLAMA_URL` / `LLM_BACKEND` env vars before exec'ing `server.py`:
 
 ```bash
 claude mcp add -s user memory /absolute/path/to/run_server.sh
 ```
 
-Restart Claude Code; the five tools above appear under `mcp__memory__*`.
+## Auto-capture (Claude Code hooks)
+
+`install.py` wires four shell scripts in `hooks/` to Claude Code lifecycle events:
+
+| Hook event         | Script                          | What it does |
+|--------------------|---------------------------------|--------------|
+| `SessionStart`     | `hooks/session_start.sh`        | Emits up to 8 past memories for the current scope as `additionalContext`. Also sweeps any orphaned session buffers older than 1 hour. No LLM call. |
+| `UserPromptSubmit` | `hooks/user_prompt_submit.sh`   | Appends the user prompt to a per-session JSONL buffer at `~/.claude/memory/sessions/<id>.jsonl`. |
+| `PostToolUse`      | `hooks/post_tool_use.sh`        | Appends the tool name + truncated input/output to the same buffer. |
+| `SessionEnd`       | `hooks/session_end.sh`          | LLM-summarizes the buffer into one `session_summary` plus up to three sub-memories, then deletes the buffer. |
+
+Scope is derived from the session's `cwd`: basename of the nearest `.git` toplevel, else basename of `cwd`, else `global`. Every hook is wrapped to exit 0 on failure — a memory-agent fault cannot break a Claude Code session.
 
 ## Run directly (debugging)
 
@@ -101,12 +110,15 @@ Small and procedural; `models/` is the only package.
 | File / Dir            | Role                                                          |
 |-----------------------|---------------------------------------------------------------|
 | `server.py`           | Entry point: `db.init_db()` then `mcp.run()`.                 |
-| `tools.py`            | `FastMCP` app and the five `@mcp.tool()` handlers.            |
-| `db.py`               | SQLite path/init, FTS upsert/delete, query-term extraction.   |
+| `tools.py`            | `FastMCP` app and the eight `@mcp.tool()` handlers.           |
+| `db.py`               | SQLite path/init, FTS upsert/delete, query-term extraction, session-buffer iteration. |
 | `llm.py`              | LLM dispatch (Ollama / Bedrock), JSON extraction, ranking.    |
+| `hook_handler.py`     | CLI entry for Claude Code hooks: `inject-context`, `record`, `summarize-session`, `sweep`. |
+| `hooks/*.sh`          | Thin shell wrappers pointed at `hook_handler.py` from `~/.claude/settings.json`. |
+| `install.py`          | One-shot: registers the MCP server and merges hook entries into `~/.claude/settings.json`. |
 | `models/`             | Pydantic models and reusable `Annotated` validators.          |
 | `test_integration.py` | Live-LLM tests, isolated to `memory_test.db` + `__test__` scope. |
-| `test_validation.py`  | Local tests; mocks `llm.llm_call`, uses a tempdir DB.         |
+| `test_validation.py`  | Local tests; mocks `llm.llm_call`, uses a tempdir DB + sessions dir. |
 
 See `CLAUDE.md` for deeper architecture notes and `AGENTS.md` for code-style conventions.
 

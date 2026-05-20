@@ -3,9 +3,12 @@
 import os
 import re
 import sqlite3
+import time
+from collections.abc import Iterator
 
 DB_DIR = os.path.join(os.path.expanduser("~"), ".claude", "memory")
 DB_PATH = os.path.join(DB_DIR, "memory.db")
+SESSIONS_DIR = os.path.join(DB_DIR, "sessions")
 STOP_WORDS = {
     "the",
     "a",
@@ -65,6 +68,7 @@ def get_db() -> sqlite3.Connection:
 
 def init_db() -> None:
     os.makedirs(DB_DIR, exist_ok=True)
+    os.makedirs(SESSIONS_DIR, exist_ok=True)
     conn = get_db()
     conn.executescript("""
         CREATE TABLE IF NOT EXISTS memories (
@@ -131,3 +135,33 @@ def upsert_fts_memory(
         )
     except sqlite3.OperationalError:
         pass
+
+
+def resolve_memory_id(conn: sqlite3.Connection, id_or_prefix: str) -> str | None:
+    id_or_prefix = (id_or_prefix or "").strip()
+    if not id_or_prefix:
+        return None
+    if len(id_or_prefix) >= 36:
+        row = conn.execute(
+            "SELECT id FROM memories WHERE id = ?", (id_or_prefix,)
+        ).fetchone()
+        return row["id"] if row else None
+    row = conn.execute(
+        "SELECT id FROM memories WHERE id LIKE ? LIMIT 1", (f"{id_or_prefix}%",)
+    ).fetchone()
+    return row["id"] if row else None
+
+
+def iter_session_buffers(stale_seconds: int) -> Iterator[str]:
+    if not os.path.isdir(SESSIONS_DIR):
+        return
+    cutoff = time.time() - max(0, stale_seconds)
+    for name in os.listdir(SESSIONS_DIR):
+        if not name.endswith(".jsonl"):
+            continue
+        path = os.path.join(SESSIONS_DIR, name)
+        try:
+            if os.path.getmtime(path) < cutoff:
+                yield path
+        except OSError:
+            continue

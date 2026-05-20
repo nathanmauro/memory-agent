@@ -12,9 +12,7 @@ import time
 # Patch DB to use a test database
 TEST_DB = os.path.join(os.path.expanduser("~"), ".claude", "memory", "memory_test.db")
 
-import db
-import llm
-import tools
+from mcp_memory_agent import db, llm, tools
 
 db.DB_PATH = TEST_DB
 db.init_db()

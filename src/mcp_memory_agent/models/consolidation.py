@@ -2,7 +2,7 @@
 
 from pydantic import BaseModel, Field, model_validator
 
-from models.types import OptionalText, StrippedText
+from .types import OptionalText, StrippedText
 
 
 class ConsolidationAction(BaseModel):
