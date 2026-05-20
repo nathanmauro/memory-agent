@@ -1,4 +1,4 @@
-"""LLM helpers for the memory agent. Supports Ollama and Amazon Bedrock backends."""
+"""LLM helpers for the memory agent. Supports Ollama, LM Studio, and Amazon Bedrock backends."""
 
 import json
 import os
@@ -10,6 +10,13 @@ LLM_BACKEND = os.environ.get("LLM_BACKEND", "ollama")
 
 OLLAMA_URL = os.environ.get("OLLAMA_URL", "http://localhost:11434")
 OLLAMA_MODEL = os.environ.get("OLLAMA_MODEL", "qwen2.5:14b")
+
+LM_STUDIO_URL = os.environ.get("LM_STUDIO_URL", "http://localhost:1234")
+LM_STUDIO_MODEL = os.environ.get(
+    "LM_STUDIO_MODEL", "qwen3-4b-instruct-2507-mlx"
+)
+# Thinking models burn tokens on <reasoning> before the answer; give them room.
+LM_STUDIO_MAX_TOKENS = int(os.environ.get("LM_STUDIO_MAX_TOKENS", "4096"))
 
 AWS_REGION = os.environ.get("AWS_REGION", "us-east-1")
 BEDROCK_MODEL = os.environ.get(
@@ -50,6 +57,27 @@ def _ollama_call(system: str, user: str) -> str:
         return json.loads(resp.read().decode())["response"]
 
 
+def _lm_studio_call(system: str, user: str) -> str:
+    payload = json.dumps({
+        "model": LM_STUDIO_MODEL,
+        "messages": [
+            {"role": "system", "content": system},
+            {"role": "user", "content": user},
+        ],
+        "temperature": 0.1,
+        "max_tokens": LM_STUDIO_MAX_TOKENS,
+        "stream": False,
+    }).encode()
+    req = urllib.request.Request(
+        f"{LM_STUDIO_URL}/v1/chat/completions",
+        data=payload,
+        headers={"Content-Type": "application/json"},
+    )
+    with urllib.request.urlopen(req, timeout=300) as resp:
+        body = json.loads(resp.read().decode())
+    return body["choices"][0]["message"].get("content", "") or ""
+
+
 def _bedrock_call(system: str, user: str) -> str:
     client = _get_bedrock()
     response = client.converse(
@@ -69,6 +97,8 @@ def _bedrock_call(system: str, user: str) -> str:
 def llm_call(system: str, user: str) -> str:
     if LLM_BACKEND == "bedrock":
         return _bedrock_call(system, user)
+    if LLM_BACKEND in ("lm-studio", "lmstudio"):
+        return _lm_studio_call(system, user)
     return _ollama_call(system, user)
 
 
