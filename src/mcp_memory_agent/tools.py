@@ -446,34 +446,13 @@ def _apply_consolidation_actions(
     return applied
 
 
-
-
 @mcp.tool()
-def memory_forget(id: str) -> str:
-    """Delete a specific memory by ID (or first 8 chars of ID).
-
-    Args:
-        id: Memory UUID (full or first 8 characters)
-    """
-    conn = db.get_db()
-    resolved = db.resolve_memory_id(conn, id)
-    if not resolved:
-        conn.close()
-        return f"No memory found matching '{id}'"
-
-    conn.execute("DELETE FROM memories WHERE id = ?", (resolved,))
-    db.delete_fts_memory(conn, resolved)
-    conn.commit()
-    conn.close()
-    return f"Deleted memory {resolved}"
-
-
-@mcp.tool()
-def memory_consolidate(scope: str) -> str:
+def memory_consolidate(scope: str, apply: bool = False) -> str:
     """Consolidate memories in a scope: merge duplicates, update stale info, remove obsolete entries.
 
     Args:
         scope: Which scope to consolidate (e.g. 'global', 'arduino')
+        apply: When False (default), write a proposal file only. When True, backup then apply actions.
     """
     conn = db.get_db()
     rows = conn.execute(
@@ -521,43 +500,46 @@ If nothing needs consolidation, return {"actions": [], "summary": "all memories 
         return f"Consolidation failed: {e}"
 
     if not result.actions:
-        return f"Scope '{scope}': {result.summary or 'nothing to consolidate'}"
+        summary = result.summary or "nothing to consolidate"
+        if not apply:
+            proposal_path = db.write_proposal(
+                scope, {"actions": [], "summary": summary}
+            )
+            if proposal_path:
+                return f"Scope '{scope}': {summary} (proposal: {proposal_path})"
+            return f"Scope '{scope}': {summary}"
+        return f"Scope '{scope}': {summary}"
 
+    if not apply:
+        proposal_path = db.write_proposal(
+            scope,
+            {
+                "actions": [action.model_dump() for action in result.actions],
+                "summary": result.summary,
+            },
+        )
+        if proposal_path:
+            return (
+                f"Proposal written to {proposal_path}. "
+                f"{len(result.actions)} proposed actions. {result.summary}"
+            )
+        return (
+            f"Dry run for scope '{scope}': {len(result.actions)} proposed actions. "
+            f"{result.summary}"
+        )
+
+    backup_path = db.write_backup_snapshot(scope)
     conn = db.get_db()
-    now = datetime.now(timezone.utc).isoformat()
-    applied = 0
-
-    for action in result.actions:
-        try:
-            if (
-                action.type == "merge"
-                and action.keep_id
-                and action.delete_id
-                and action.new_content
-            ):
-                conn.execute(
-                    "UPDATE memories SET content = ?, updated_at = ? WHERE id = ?",
-                    (action.new_content, now, action.keep_id),
-                )
-                conn.execute("DELETE FROM memories WHERE id = ?", (action.delete_id,))
-                db.delete_fts_memory(conn, action.delete_id)
-                db.upsert_fts_memory(conn, action.keep_id, action.new_content, "")
-                applied += 1
-            elif action.type == "delete" and action.id:
-                conn.execute("DELETE FROM memories WHERE id = ?", (action.id,))
-                db.delete_fts_memory(conn, action.id)
-                applied += 1
-            elif action.type == "update" and action.id and action.new_content:
-                conn.execute(
-                    "UPDATE memories SET content = ?, updated_at = ? WHERE id = ?",
-                    (action.new_content, now, action.id),
-                )
-                db.upsert_fts_memory(conn, action.id, action.new_content, "")
-                applied += 1
-        except Exception:
-            continue
-
+    lifecycle_changed = db.apply_lifecycle_transitions(conn, scope)
+    applied = _apply_consolidation_actions(conn, result)
     conn.commit()
     conn.close()
 
-    return f"Consolidated scope '{scope}': {applied} actions applied. {result.summary}"
+    backup_note = f" Backup: {backup_path}." if backup_path else ""
+    lifecycle_note = ""
+    if lifecycle_changed:
+        lifecycle_note = f" Lifecycle transitions: {lifecycle_changed}."
+    return (
+        f"Consolidated scope '{scope}': {applied} actions applied."
+        f"{lifecycle_note}{backup_note} {result.summary}"
+    )
