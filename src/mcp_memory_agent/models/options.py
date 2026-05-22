@@ -44,3 +44,11 @@ class MemoryTimelineOptions(BaseModel):
     before_iso: StrippedText = ""
     after_iso: StrippedText = ""
     limit: ListLimit = 20
+
+
+class MemorySessionSearchOptions(BaseModel):
+    """Validated options for the memory_session_search tool."""
+
+    query: StrippedText
+    scope: StrippedText = ""
+    limit: ListLimit = 10

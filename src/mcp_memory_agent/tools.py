@@ -14,6 +14,7 @@ from .models import (
     MemoryListOptions,
     MemoryQueryOptions,
     MemoryRecord,
+    MemorySessionSearchOptions,
     MemoryTimelineOptions,
 )
 
@@ -347,6 +348,38 @@ def memory_forget(id: str) -> str:
     conn.commit()
     conn.close()
     return f"Deleted memory {resolved}"
+
+@mcp.tool()
+def memory_session_search(query: str, scope: str = "", limit: int = 10) -> str:
+    """Search archived session transcripts (cold storage). JSONL on disk is source of truth.
+
+    Args:
+        query: What to search for in archived session content
+        scope: Filter by project scope. Empty = search all scopes.
+        limit: Maximum results (default 10)
+    """
+    try:
+        options = MemorySessionSearchOptions(query=query, scope=scope, limit=limit)
+    except Exception:
+        options = MemorySessionSearchOptions(query=str(query))
+
+    conn = db.get_db()
+    hits = db.search_session_archive(
+        conn, options.query, options.scope, options.limit
+    )
+    conn.close()
+
+    if not hits:
+        return "No archived sessions found."
+
+    lines = []
+    for hit in hits:
+        lines.append(
+            f"{hit['session_id'][:8]} [{hit['scope']}] {hit['archived_at'][:10]} — "
+            f"{hit['snippet']}"
+        )
+    return f"{len(hits)} archived sessions:\n" + "\n".join(lines)
+
 
 
 @mcp.tool()
