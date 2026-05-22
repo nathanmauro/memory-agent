@@ -8,6 +8,7 @@ from .options import (
     MemoryListOptions,
     MemoryQueryOptions,
     MemorySessionSearchOptions,
+    MemorySessionGetOptions,
     MemoryTimelineOptions,
 )
 
@@ -21,5 +22,6 @@ __all__ = [
     "MemoryQueryOptions",
     "MemoryRecord",
     "MemorySessionSearchOptions",
+    "MemorySessionGetOptions",
     "MemoryTimelineOptions",
 ]
