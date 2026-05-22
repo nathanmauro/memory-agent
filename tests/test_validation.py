@@ -10,6 +10,7 @@ import tempfile
 from datetime import datetime, timedelta, timezone
 
 from mcp_memory_agent import db, hook_handler, llm, tools
+from mcp_memory_agent.integrations import codex
 
 PASS = 0
 FAIL = 0
@@ -17,6 +18,7 @@ TEST_ROOT = os.path.join(tempfile.gettempdir(), "memory_validation_test")
 TEST_DB = os.path.join(TEST_ROOT, "memory.db")
 TEST_SESSIONS = os.path.join(TEST_ROOT, "sessions")
 ORIGINAL_DB_PATH = db.DB_PATH
+ORIGINAL_DB_DIR = db.DB_DIR
 ORIGINAL_SESSIONS_DIR = db.SESSIONS_DIR
 ORIGINAL_LLM_CALL = llm.llm_call
 
@@ -35,13 +37,12 @@ def fail(name: str, reason: str) -> None:
 
 def reset_db() -> None:
     shutil.rmtree(TEST_ROOT, ignore_errors=True)
-    os.makedirs(TEST_ROOT, exist_ok=True)
-    db.DB_PATH = TEST_DB
-    db.SESSIONS_DIR = TEST_SESSIONS
+    db.configure_paths(TEST_ROOT)
     db.init_db()
 
 
 def restore_state() -> None:
+    db.configure_paths(ORIGINAL_DB_DIR)
     db.DB_PATH = ORIGINAL_DB_PATH
     db.SESSIONS_DIR = ORIGINAL_SESSIONS_DIR
     llm.llm_call = ORIGINAL_LLM_CALL
@@ -313,6 +314,85 @@ def test_hook_summarize_skips_short_buffer() -> None:
         )
 
 
+def test_hook_accepts_codex_style_payload() -> None:
+    reset_db()
+    payload = {
+        "threadId": "codex-session-001",
+        "workingDirectory": TEST_ROOT,
+        "toolName": "exec_command",
+        "input": {"cmd": "echo hi"},
+        "output": {"stdout": "hi"},
+    }
+
+    hook_handler._append_event(payload, "tool_use")
+
+    buffer_path = os.path.join(db.SESSIONS_DIR, "codex-session-001.jsonl")
+    if not os.path.exists(buffer_path):
+        fail("hook_accepts_codex_style_payload", "buffer was not written")
+        return
+    with open(buffer_path) as f:
+        row = json.loads(f.readline())
+    if (
+        row["kind"] == "tool_use"
+        and row["scope"] == os.path.basename(TEST_ROOT)
+        and row["data"]["tool_name"] == "exec_command"
+    ):
+        ok("hook_accepts_codex_style_payload")
+    else:
+        fail("hook_accepts_codex_style_payload", f"unexpected row: {row}")
+
+
+def test_codex_hook_merge_preserves_existing() -> None:
+    reset_db()
+    hooks_dir = os.path.join(TEST_ROOT, ".codex")
+    os.makedirs(hooks_dir, exist_ok=True)
+    hooks_path = os.path.join(hooks_dir, "hooks.json")
+    existing = {
+        "hooks": {
+            "Stop": [
+                {
+                    "matcher": "",
+                    "hooks": [
+                        {
+                            "type": "command",
+                            "command": "/Users/nathan/Developer/config/voice/bin/agent-speak-last",
+                            "timeout": 1,
+                        }
+                    ],
+                }
+            ]
+        }
+    }
+    with open(hooks_path, "w") as f:
+        json.dump(existing, f)
+
+    first_added = codex.install_hooks(TEST_ROOT)
+    second_added = codex.install_hooks(TEST_ROOT)
+
+    with open(hooks_path) as f:
+        data = json.load(f)
+    stop_entries = data["hooks"].get("Stop", [])
+    post_entries = data["hooks"].get("PostToolUse", [])
+    commands = []
+    for entry in stop_entries:
+        for hook in entry.get("hooks", []):
+            commands.append(hook.get("command", ""))
+
+    if (
+        first_added == 2
+        and second_added == 0
+        and any("agent-speak-last" in command for command in commands)
+        and any("finalize-session" in command for command in commands)
+        and post_entries
+    ):
+        ok("codex_hook_merge_preserves_existing")
+    else:
+        fail(
+            "codex_hook_merge_preserves_existing",
+            f"first={first_added} second={second_added} data={data}",
+        )
+
+
 def test_memory_session_search_finds_archived_content() -> None:
     reset_db()
     session_id = "archive-search-001"
@@ -349,6 +429,26 @@ def test_memory_session_search_finds_archived_content() -> None:
         fail("memory_session_search_finds_archived_content", result)
 
 
+def test_memory_access_tracking() -> None:
+    reset_db()
+    insert_memory("ffffffff-ffff-ffff-ffff-ffffffffffff", "tracked memory")
+    tools.memory_get(["ffffffff"])
+    conn = db.get_db()
+    row = conn.execute(
+        "SELECT access_count, last_accessed_at FROM memories WHERE id = ?",
+        ("ffffffff-ffff-ffff-ffff-ffffffffffff",),
+    ).fetchone()
+    conn.close()
+    if row and row["access_count"] == 1 and row["last_accessed_at"]:
+        ok("memory_access_tracking")
+    else:
+        fail("memory_access_tracking", f"row={dict(row) if row else None}")
+
+
+
+
+
+
 if __name__ == "__main__":
     try:
         test_extract_memory_metadata_defaults()
@@ -360,7 +460,11 @@ if __name__ == "__main__":
         test_memory_timeline_orders_and_filters()
         test_hook_summarize_inserts_memory()
         test_hook_summarize_skips_short_buffer()
+        test_hook_accepts_codex_style_payload()
+        test_codex_hook_merge_preserves_existing()
         test_memory_session_search_finds_archived_content()
+        test_memory_access_tracking()
+test_inject_context_respects_active_status()
     finally:
         restore_state()
 

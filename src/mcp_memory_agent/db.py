@@ -7,7 +7,7 @@ import shutil
 import sqlite3
 import time
 from collections.abc import Iterator
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 DEFAULT_MEMORY_HOME = os.path.join(os.path.expanduser("~"), ".claude", "memory")
 DB_DIR = os.path.abspath(
@@ -17,6 +17,10 @@ DB_PATH = os.path.join(DB_DIR, "memory.db")
 SESSIONS_DIR = os.path.join(DB_DIR, "sessions")
 ARCHIVE_DIR = os.path.join(DB_DIR, "archive")
 ARCHIVE_SESSIONS_DIR = os.path.join(ARCHIVE_DIR, "sessions")
+PROPOSALS_DIR = os.path.join(DB_DIR, "proposals")
+BACKUPS_DIR = os.path.join(DB_DIR, "backups")
+STALE_AFTER_DAYS = 30
+ARCHIVE_AFTER_DAYS = 90
 STOP_WORDS = {
     "the",
     "a",
@@ -69,12 +73,14 @@ STOP_WORDS = {
 
 def configure_paths(memory_home: str) -> None:
     global DB_DIR, DB_PATH, SESSIONS_DIR
-    global ARCHIVE_DIR, ARCHIVE_SESSIONS_DIR
+    global ARCHIVE_DIR, ARCHIVE_SESSIONS_DIR, PROPOSALS_DIR, BACKUPS_DIR
     DB_DIR = os.path.abspath(os.path.expanduser(memory_home or DEFAULT_MEMORY_HOME))
     DB_PATH = os.path.join(DB_DIR, "memory.db")
     SESSIONS_DIR = os.path.join(DB_DIR, "sessions")
     ARCHIVE_DIR = os.path.join(DB_DIR, "archive")
     ARCHIVE_SESSIONS_DIR = os.path.join(ARCHIVE_DIR, "sessions")
+    PROPOSALS_DIR = os.path.join(DB_DIR, "proposals")
+    BACKUPS_DIR = os.path.join(DB_DIR, "backups")
 
 
 def get_db() -> sqlite3.Connection:
@@ -101,6 +107,8 @@ def init_db() -> None:
     os.makedirs(DB_DIR, exist_ok=True)
     os.makedirs(SESSIONS_DIR, exist_ok=True)
     os.makedirs(ARCHIVE_SESSIONS_DIR, exist_ok=True)
+    os.makedirs(PROPOSALS_DIR, exist_ok=True)
+    os.makedirs(BACKUPS_DIR, exist_ok=True)
     conn = get_db()
     conn.executescript("""
         CREATE TABLE IF NOT EXISTS memories (
@@ -129,6 +137,10 @@ def init_db() -> None:
         CREATE INDEX IF NOT EXISTS idx_session_archive_scope ON session_archive(scope);
         CREATE INDEX IF NOT EXISTS idx_session_archive_archived_at ON session_archive(archived_at);
     """)
+    _ensure_column(conn, "memories", "status", "TEXT NOT NULL DEFAULT 'active'")
+    _ensure_column(conn, "memories", "last_accessed_at", "TEXT NOT NULL DEFAULT ''")
+    _ensure_column(conn, "memories", "access_count", "INTEGER NOT NULL DEFAULT 0")
+    _ensure_column(conn, "memories", "pinned", "INTEGER NOT NULL DEFAULT 0")
     try:
         conn.execute("""
             CREATE VIRTUAL TABLE IF NOT EXISTS memories_fts
@@ -153,7 +165,7 @@ def init_db() -> None:
 
 
 def build_memory_filters(
-    scope: str = "", category: str = "", alias: str = ""
+    scope: str = "", category: str = "", alias: str = "", status: str = ""
 ) -> tuple[list[str], list]:
     prefix = f"{alias}." if alias else ""
     conditions = []
@@ -164,6 +176,9 @@ def build_memory_filters(
     if category:
         conditions.append(f"{prefix}category = ?")
         params.append(category)
+    if status:
+        conditions.append(f"{prefix}status = ?")
+        params.append(status)
     return conditions, params
 
 
@@ -445,3 +460,110 @@ def search_session_archive(
                 break
     return hits[:limit]
 
+
+def touch_memory_access(conn: sqlite3.Connection, mem_ids: list[str]) -> None:
+    if not mem_ids:
+        return
+    now = datetime.now(timezone.utc).isoformat()
+    for mem_id in mem_ids:
+        try:
+            conn.execute(
+                """
+                UPDATE memories
+                SET access_count = access_count + 1, last_accessed_at = ?
+                WHERE id = ?
+                """,
+                (now, mem_id),
+            )
+        except Exception:
+            continue
+
+
+def apply_lifecycle_transitions(conn: sqlite3.Connection, scope: str) -> int:
+    now = datetime.now(timezone.utc)
+    stale_cutoff = (now - timedelta(days=STALE_AFTER_DAYS)).isoformat()
+    archive_cutoff = (now - timedelta(days=ARCHIVE_AFTER_DAYS)).isoformat()
+    changed = 0
+
+    try:
+        cur = conn.execute(
+            """
+            UPDATE memories
+            SET status = 'stale'
+            WHERE scope = ?
+              AND status = 'active'
+              AND pinned = 0
+              AND importance < 4
+              AND (
+                    (last_accessed_at != '' AND last_accessed_at < ?)
+                 OR (last_accessed_at = '' AND updated_at < ?)
+              )
+            """,
+            (scope, stale_cutoff, stale_cutoff),
+        )
+        changed += cur.rowcount
+    except Exception:
+        pass
+
+    try:
+        cur = conn.execute(
+            """
+            UPDATE memories
+            SET status = 'archived'
+            WHERE scope = ?
+              AND status = 'stale'
+              AND pinned = 0
+              AND (
+                    (last_accessed_at != '' AND last_accessed_at < ?)
+                 OR (last_accessed_at = '' AND updated_at < ?)
+              )
+            """,
+            (scope, archive_cutoff, archive_cutoff),
+        )
+        changed += cur.rowcount
+    except Exception:
+        pass
+
+    return changed
+
+
+def write_backup_snapshot(scope: str) -> str:
+    os.makedirs(BACKUPS_DIR, exist_ok=True)
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    path = os.path.join(BACKUPS_DIR, f"{_safe_path_component(scope)}-{stamp}.json")
+    conn = get_db()
+    try:
+        rows = conn.execute(
+            "SELECT * FROM memories WHERE scope = ? ORDER BY updated_at DESC",
+            (scope,),
+        ).fetchall()
+        payload = {
+            "scope": scope,
+            "created_at": datetime.now(timezone.utc).isoformat(),
+            "memories": [dict(row) for row in rows],
+        }
+    finally:
+        conn.close()
+    try:
+        with open(path, "w") as f:
+            json.dump(payload, f, indent=2)
+    except Exception:
+        return ""
+    return path
+
+
+def write_proposal(scope: str, proposal: dict) -> str:
+    os.makedirs(PROPOSALS_DIR, exist_ok=True)
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    path = os.path.join(PROPOSALS_DIR, f"{_safe_path_component(scope)}-{stamp}.json")
+    payload = {
+        "scope": scope,
+        "created_at": datetime.now(timezone.utc).isoformat(),
+        **proposal,
+    }
+    try:
+        with open(path, "w") as f:
+            json.dump(payload, f, indent=2)
+    except Exception:
+        return ""
+    return path

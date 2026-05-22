@@ -21,6 +21,14 @@ from .models import (
 mcp = FastMCP("memory-agent")
 
 
+def _touch_memories(conn: sqlite3.Connection, mem_ids: list[str]) -> None:
+    db.touch_memory_access(conn, mem_ids)
+    try:
+        conn.commit()
+    except Exception:
+        pass
+
+
 def _insert_memory(
     conn: sqlite3.Connection, content: str, scope: str, source: str
 ) -> str:
@@ -52,7 +60,12 @@ def _insert_memory(
 
     mem_id = str(uuid.uuid4())
     conn.execute(
-        "INSERT INTO memories (id, content, category, scope, tags, created_at, updated_at, source, importance) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        """
+        INSERT INTO memories (
+            id, content, category, scope, tags, created_at, updated_at,
+            source, importance, status, last_accessed_at, access_count, pinned
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', '', 0, 0)
+        """,
         (
             mem_id,
             content,
@@ -159,6 +172,8 @@ def memory_query(
     candidates = _gather_candidates(
         conn, options.query, options.scope, options.category
     )
+    if candidates:
+        _touch_memories(conn, [c.id for c in candidates[: options.limit]])
     conn.close()
 
     if not candidates:
@@ -194,6 +209,8 @@ def memory_index(
     candidates = _gather_candidates(
         conn, options.query, options.scope, options.category
     )
+    if candidates:
+        _touch_memories(conn, [c.id for c in candidates[: options.limit]])
     conn.close()
 
     if not candidates:
@@ -240,6 +257,8 @@ def memory_get(ids: list[str]) -> str:
         if row:
             found.append(MemoryRecord.from_row(row))
             seen.add(resolved)
+    if found:
+        _touch_memories(conn, [m.id for m in found])
     conn.close()
 
     if not found:
@@ -299,21 +318,28 @@ def memory_timeline(
 
 
 @mcp.tool()
-def memory_list(scope: str = "", category: str = "", limit: int = 20) -> str:
+def memory_list(
+    scope: str = "", category: str = "", status: str = "", limit: int = 20
+) -> str:
     """List recent memories. No LLM call — just a database query.
 
     Args:
         scope: Filter by scope. Empty = all scopes.
         category: Filter by category. Empty = all categories.
+        status: Filter by status (active, stale, archived). Empty = all statuses.
         limit: Maximum results (default 20)
     """
     try:
-        options = MemoryListOptions(scope=scope, category=category, limit=limit)
+        options = MemoryListOptions(
+            scope=scope, category=category, status=status, limit=limit
+        )
     except Exception:
         options = MemoryListOptions()
 
     conn = db.get_db()
-    conditions, params = db.build_memory_filters(options.scope, options.category)
+    conditions, params = db.build_memory_filters(
+        options.scope, options.category, status=options.status
+    )
     where = "WHERE " + " AND ".join(conditions) if conditions else ""
     params.append(options.limit)
 
@@ -349,6 +375,7 @@ def memory_forget(id: str) -> str:
     conn.close()
     return f"Deleted memory {resolved}"
 
+
 @mcp.tool()
 def memory_session_search(query: str, scope: str = "", limit: int = 10) -> str:
     """Search archived session transcripts (cold storage). JSONL on disk is source of truth.
@@ -380,6 +407,65 @@ def memory_session_search(query: str, scope: str = "", limit: int = 10) -> str:
         )
     return f"{len(hits)} archived sessions:\n" + "\n".join(lines)
 
+
+def _apply_consolidation_actions(
+    conn: sqlite3.Connection, result: ConsolidationResult
+) -> int:
+    now = datetime.now(timezone.utc).isoformat()
+    applied = 0
+
+    for action in result.actions:
+        try:
+            if (
+                action.type == "merge"
+                and action.keep_id
+                and action.delete_id
+                and action.new_content
+            ):
+                conn.execute(
+                    "UPDATE memories SET content = ?, updated_at = ? WHERE id = ?",
+                    (action.new_content, now, action.keep_id),
+                )
+                conn.execute("DELETE FROM memories WHERE id = ?", (action.delete_id,))
+                db.delete_fts_memory(conn, action.delete_id)
+                db.upsert_fts_memory(conn, action.keep_id, action.new_content, "")
+                applied += 1
+            elif action.type == "delete" and action.id:
+                conn.execute("DELETE FROM memories WHERE id = ?", (action.id,))
+                db.delete_fts_memory(conn, action.id)
+                applied += 1
+            elif action.type == "update" and action.id and action.new_content:
+                conn.execute(
+                    "UPDATE memories SET content = ?, updated_at = ? WHERE id = ?",
+                    (action.new_content, now, action.id),
+                )
+                db.upsert_fts_memory(conn, action.id, action.new_content, "")
+                applied += 1
+        except Exception:
+            continue
+    return applied
+
+
+
+
+@mcp.tool()
+def memory_forget(id: str) -> str:
+    """Delete a specific memory by ID (or first 8 chars of ID).
+
+    Args:
+        id: Memory UUID (full or first 8 characters)
+    """
+    conn = db.get_db()
+    resolved = db.resolve_memory_id(conn, id)
+    if not resolved:
+        conn.close()
+        return f"No memory found matching '{id}'"
+
+    conn.execute("DELETE FROM memories WHERE id = ?", (resolved,))
+    db.delete_fts_memory(conn, resolved)
+    conn.commit()
+    conn.close()
+    return f"Deleted memory {resolved}"
 
 
 @mcp.tool()
