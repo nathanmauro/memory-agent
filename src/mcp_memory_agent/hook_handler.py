@@ -1,14 +1,15 @@
 #!/usr/bin/env python3
-"""Claude Code hook entrypoint for the memory agent.
+"""Session-capture hook entrypoint for the memory agent.
 
 Reads hook JSON from stdin. Subcommands:
-  inject-context     Print SessionStart additionalContext JSON.
+  inject-context     Print client-specific startup context JSON.
   record             Append a transcript event to the per-session buffer.
-  summarize-session  LLM-summarize the buffer on SessionEnd and persist memories.
+  summarize-session  LLM-summarize the current buffer and persist memories.
+  finalize-session   Summarize the current buffer and sweep stale buffers.
   sweep              Summarize orphaned (stale) buffers and delete them.
 
 Every code path is best-effort: failures are swallowed so that a memory-agent
-fault never breaks a Claude Code session.
+fault never breaks a coding-agent session.
 """
 
 import argparse
@@ -22,6 +23,8 @@ from .models import MemoryRecord
 
 MAX_EVENT_BYTES = 500
 SESSION_STALE_SECONDS = 3600
+INJECT_BUDGET_CHARS = 8000
+WARM_BUDGET_RATIO = 0.7
 
 
 def _read_hook_input() -> dict:
@@ -53,6 +56,45 @@ def _derive_scope(cwd: str) -> str:
     return os.path.basename(path) or "global"
 
 
+def _payload_value(payload: dict, keys: list[str], default: object = "") -> object:
+    for key in keys:
+        value = payload.get(key)
+        if value not in (None, ""):
+            return value
+    return default
+
+
+def _payload_cwd(payload: dict) -> str:
+    value = _payload_value(
+        payload, ["cwd", "workdir", "working_dir", "workingDirectory"], ""
+    )
+    if isinstance(value, str) and value:
+        return value
+    return os.environ.get("PWD", "")
+
+
+def _payload_session_id(payload: dict) -> object:
+    value = _payload_value(
+        payload,
+        [
+            "session_id",
+            "sessionId",
+            "conversation_id",
+            "conversationId",
+            "thread_id",
+            "threadId",
+        ],
+        "",
+    )
+    if value:
+        return value
+    return _payload_value(
+        os.environ,
+        ["MEMORY_AGENT_SESSION_ID", "CLAUDE_SESSION_ID", "CODEX_SESSION_ID"],
+        "",
+    )
+
+
 def _truncate(value: object, limit: int = MAX_EVENT_BYTES) -> object:
     if isinstance(value, str):
         return value if len(value) <= limit else value[:limit] + "…"
@@ -73,18 +115,28 @@ def _session_path(session_id: object) -> str | None:
 
 
 def _append_event(payload: dict, kind: str) -> None:
-    path = _session_path(payload.get("session_id"))
+    path = _session_path(_payload_session_id(payload))
     if not path:
         return
-    scope = _derive_scope(payload.get("cwd", ""))
+    scope = _derive_scope(_payload_cwd(payload))
 
     if kind == "prompt":
-        data: object = {"prompt": payload.get("prompt", "")}
+        data: object = {
+            "prompt": _payload_value(
+                payload, ["prompt", "user_prompt", "userPrompt", "input"], ""
+            )
+        }
     elif kind == "tool_use":
         data = {
-            "tool_name": payload.get("tool_name", ""),
-            "tool_input": payload.get("tool_input", {}),
-            "tool_response": payload.get("tool_response", {}),
+            "tool_name": _payload_value(
+                payload, ["tool_name", "toolName", "tool", "name"], ""
+            ),
+            "tool_input": _payload_value(
+                payload, ["tool_input", "toolInput", "input", "arguments"], {}
+            ),
+            "tool_response": _payload_value(
+                payload, ["tool_response", "toolResponse", "output", "result"], {}
+            ),
         }
     else:
         return
@@ -152,7 +204,7 @@ def _llm_summarize(events: list[dict], scope: str) -> dict:
         return {}
 
     system = (
-        "You are a memory extractor. Given a Claude Code session transcript, "
+        "You are a memory extractor. Given a coding-agent session transcript, "
         "produce a JSON object describing what should be remembered for future sessions.\n\n"
         "Respond with ONLY valid JSON:\n"
         "{\n"
@@ -221,59 +273,105 @@ def _summarize_buffer(path: str, fallback_scope: str = "global") -> None:
         conn.close()
 
 
+def _session_summary_for_source(
+    conn, scope: str, session_id: str
+) -> str:
+    try:
+        row = conn.execute(
+            """
+            SELECT content FROM memories
+            WHERE scope = ? AND source = ? AND category = 'session_summary'
+            ORDER BY updated_at DESC LIMIT 1
+            """,
+            (scope, session_id),
+        ).fetchone()
+        if row:
+            return str(row["content"]).replace("\n", " ")[:120]
+    except Exception:
+        pass
+    return ""
+
 
 def _inject_context(payload: dict) -> None:
-    scope = _derive_scope(payload.get("cwd", ""))
+    scope = _derive_scope(_payload_cwd(payload))
 
     _sweep()
 
     conn = db.get_db()
     try:
-        top_rows = conn.execute(
-            "SELECT * FROM memories WHERE scope = ? ORDER BY importance DESC, updated_at DESC LIMIT 3",
+        warm_budget = int(INJECT_BUDGET_CHARS * WARM_BUDGET_RATIO)
+        header = f"Past memories for scope '{scope}':\n"
+        used = len(header)
+        bullets: list[str] = []
+
+        rows = conn.execute(
+            """
+            SELECT * FROM memories
+            WHERE scope = ? AND status = 'active'
+            ORDER BY importance DESC, updated_at DESC
+            """,
             (scope,),
         ).fetchall()
-        top = [MemoryRecord.from_row(r) for r in top_rows]
-        top_ids = {m.id for m in top}
-        recent_rows = conn.execute(
-            "SELECT * FROM memories WHERE scope = ? ORDER BY updated_at DESC LIMIT 8",
-            (scope,),
-        ).fetchall()
-        recent: list[MemoryRecord] = []
-        for r in recent_rows:
-            rec = MemoryRecord.from_row(r)
-            if rec.id not in top_ids:
-                recent.append(rec)
-                if len(recent) >= 5:
-                    break
+        for row in rows:
+            m = MemoryRecord.from_row(row)
+            snippet = m.content.replace("\n", " ")[:200]
+            line = f"- [{m.id[:8]}] ({m.category}) {snippet}"
+            line_len = len(line) + 1
+            if used + line_len > warm_budget:
+                break
+            bullets.append(line)
+            used += line_len
+
+        pointer_lines: list[str] = []
+        remaining = INJECT_BUDGET_CHARS - used
+        if remaining > 120:
+            archives = db.list_recent_archived_sessions(conn, scope, limit=8)
+            if archives:
+                pointer_header = "\nArchived sessions (use memory_session_search to thaw):\n"
+                if used + len(pointer_header) <= INJECT_BUDGET_CHARS:
+                    used += len(pointer_header)
+                    for row in archives:
+                        session_id = row["session_id"]
+                        archived_at = str(row["archived_at"])[:10]
+                        summary = _session_summary_for_source(conn, scope, session_id)
+                        if summary:
+                            line = (
+                                f"- [{session_id[:8]}] {archived_at} — {summary}"
+                            )
+                        else:
+                            line = f"- [{session_id[:8]}] {archived_at} — archived transcript"
+                        line_len = len(line) + 1
+                        if used + line_len > INJECT_BUDGET_CHARS:
+                            break
+                        pointer_lines.append(line)
+                        used += line_len
+                    if pointer_lines:
+                        pointer_lines.insert(0, pointer_header.rstrip())
     finally:
         conn.close()
 
-    memories = top + recent
-    if not memories:
+    if not bullets and not pointer_lines:
         print(json.dumps({}))
         return
 
-    bullets = []
-    for m in memories:
-        snippet = m.content.replace("\n", " ")[:200]
-        bullets.append(f"- [{m.id[:8]}] ({m.category}) {snippet}")
-    body = f"Past memories for scope '{scope}':\n" + "\n".join(bullets)
+    body = header + "\n".join(bullets)
+    if pointer_lines:
+        body += "\n" + "\n".join(pointer_lines)
 
     out = {
         "hookSpecificOutput": {
             "hookEventName": "SessionStart",
-            "additionalContext": body,
+            "additionalContext": body[:INJECT_BUDGET_CHARS],
         }
     }
     print(json.dumps(out))
 
 
 def _summarize_session(payload: dict) -> None:
-    path = _session_path(payload.get("session_id"))
+    path = _session_path(_payload_session_id(payload))
     if not path or not os.path.exists(path):
         return
-    fallback = _derive_scope(payload.get("cwd", ""))
+    fallback = _derive_scope(_payload_cwd(payload))
     _summarize_buffer(path, fallback_scope=fallback)
 
 
@@ -292,6 +390,7 @@ def main() -> None:
     record = sub.add_parser("record")
     record.add_argument("--kind", choices=["prompt", "tool_use"], required=True)
     sub.add_parser("summarize-session")
+    sub.add_parser("finalize-session")
     sub.add_parser("sweep")
 
     args = parser.parse_args()
@@ -304,6 +403,9 @@ def main() -> None:
         _append_event(payload, args.kind)
     elif args.cmd == "summarize-session":
         _summarize_session(payload)
+    elif args.cmd == "finalize-session":
+        _summarize_session(payload)
+        _sweep()
     elif args.cmd == "sweep":
         _sweep()
 

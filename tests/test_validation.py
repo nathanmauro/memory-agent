@@ -447,6 +447,46 @@ def test_memory_access_tracking() -> None:
 
 
 
+def test_inject_context_respects_active_status() -> None:
+    reset_db()
+    scope = os.path.basename(TEST_ROOT)
+    insert_memory(
+        "33333333-3333-3333-3333-333333333333",
+        "active memory visible",
+        scope=scope,
+        importance=5,
+    )
+    insert_memory(
+        "44444444-4444-4444-4444-444444444444",
+        "archived memory hidden",
+        scope=scope,
+        importance=5,
+    )
+    conn = db.get_db()
+    conn.execute(
+        "UPDATE memories SET status = 'archived' WHERE id = ?",
+        ("44444444-4444-4444-4444-444444444444",),
+    )
+    conn.commit()
+    conn.close()
+
+    import io
+    import contextlib
+
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        hook_handler._inject_context({"cwd": TEST_ROOT})
+    out = json.loads(buf.getvalue())
+    body = out["hookSpecificOutput"]["additionalContext"]
+    visible = "active memory visible" in body
+    hidden = "archived memory hidden" not in body
+    if visible and hidden:
+        ok("inject_context_respects_active_status")
+    else:
+        fail(
+            "inject_context_respects_active_status",
+            f"visible={visible} hidden={hidden} body={body[:200]}",
+        )
 
 
 if __name__ == "__main__":
