@@ -5,6 +5,7 @@ Reads hook JSON from stdin. Subcommands:
   inject-context     Print SessionStart additionalContext JSON.
   record             Append a transcript event to the per-session buffer.
   summarize-session  LLM-summarize the buffer on SessionEnd and persist memories.
+  finalize-session   Summarize the current buffer and sweep stale buffers (Codex Stop).
   sweep              Summarize orphaned (stale) buffers and delete them.
   curator            Weekly lifecycle transitions and dry-run consolidate proposals.
 
@@ -57,6 +58,45 @@ def _derive_scope(cwd: str) -> str:
     return os.path.basename(path) or "global"
 
 
+def _payload_value(payload: dict, keys: list[str], default: object = "") -> object:
+    for key in keys:
+        value = payload.get(key)
+        if value not in (None, ""):
+            return value
+    return default
+
+
+def _payload_cwd(payload: dict) -> str:
+    value = _payload_value(
+        payload, ["cwd", "workdir", "working_dir", "workingDirectory"], ""
+    )
+    if isinstance(value, str) and value:
+        return value
+    return os.environ.get("PWD", "")
+
+
+def _payload_session_id(payload: dict) -> object:
+    value = _payload_value(
+        payload,
+        [
+            "session_id",
+            "sessionId",
+            "conversation_id",
+            "conversationId",
+            "thread_id",
+            "threadId",
+        ],
+        "",
+    )
+    if value:
+        return value
+    return _payload_value(
+        os.environ,
+        ["MEMORY_AGENT_SESSION_ID", "CLAUDE_SESSION_ID", "CODEX_SESSION_ID"],
+        "",
+    )
+
+
 def _truncate(value: object, limit: int = MAX_EVENT_BYTES) -> object:
     if isinstance(value, str):
         return value if len(value) <= limit else value[:limit] + "…"
@@ -77,10 +117,10 @@ def _session_path(session_id: object) -> str | None:
 
 
 def _append_event(payload: dict, kind: str) -> None:
-    path = _session_path(payload.get("session_id"))
+    path = _session_path(_payload_session_id(payload))
     if not path:
         return
-    scope = _derive_scope(payload.get("cwd", ""))
+    scope = _derive_scope(_payload_cwd(payload))
 
     if kind == "prompt":
         data: object = {"prompt": payload.get("prompt", "")}
@@ -282,7 +322,7 @@ def _session_summary_for_source(
 
 
 def _inject_context(payload: dict) -> None:
-    scope = _derive_scope(payload.get("cwd", ""))
+    scope = _derive_scope(_payload_cwd(payload))
 
     _sweep()
 
@@ -376,11 +416,16 @@ def _inject_context(payload: dict) -> None:
 
 
 def _summarize_session(payload: dict) -> None:
-    path = _session_path(payload.get("session_id"))
+    path = _session_path(_payload_session_id(payload))
     if not path or not os.path.exists(path):
         return
-    fallback = _derive_scope(payload.get("cwd", ""))
+    fallback = _derive_scope(_payload_cwd(payload))
     _summarize_buffer(path, fallback_scope=fallback)
+
+
+def _finalize_session(payload: dict) -> None:
+    _summarize_session(payload)
+    _sweep()
 
 
 def _sweep() -> None:
@@ -423,7 +468,7 @@ def _run_curator(scope: str) -> None:
 def _curator(payload: dict) -> None:
     if not db.curator_due():
         return
-    scope = _derive_scope(payload.get("cwd", ""))
+    scope = _derive_scope(_payload_cwd(payload))
     _run_curator(scope)
 
 
@@ -434,6 +479,7 @@ def main() -> None:
     record = sub.add_parser("record")
     record.add_argument("--kind", choices=["prompt", "tool_use"], required=True)
     sub.add_parser("summarize-session")
+    sub.add_parser("finalize-session")
     sub.add_parser("sweep")
     sub.add_parser("curator")
 
@@ -447,6 +493,8 @@ def main() -> None:
         _append_event(payload, args.kind)
     elif args.cmd == "summarize-session":
         _summarize_session(payload)
+    elif args.cmd == "finalize-session":
+        _finalize_session(payload)
     elif args.cmd == "sweep":
         _sweep()
     elif args.cmd == "curator":

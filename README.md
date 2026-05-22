@@ -60,13 +60,20 @@ ollama pull gemma4:26b
 
 ## Install
 
-One command registers the MCP server and writes the hook entries to `~/.claude/settings.json` (backed up to `settings.json.bak`):
+One command registers the MCP server and writes hook entries:
 
 ```bash
-.venv/bin/python install.py
+# Claude Code (default)
+.venv/bin/python -m mcp_memory_agent.install --client claude
+
+# Codex (project-local .codex/hooks.json + user MCP registration)
+.venv/bin/python -m mcp_memory_agent.install --client codex
+
+# Both
+.venv/bin/python -m mcp_memory_agent.install --client both
 ```
 
-The install is idempotent — re-running leaves existing entries alone. After it finishes, restart Claude Code; the eight tools appear under `mcp__memory__*` and the auto-capture hooks below start firing.
+For Claude Code, hooks land in `~/.claude/settings.json` (backed up to `settings.json.bak`). For Codex, enable hooks in `~/.codex/config.toml` with `[features] codex_hooks = true`. Codex `SessionStart` runs the same `inject-context` output as Claude (hot + warm memories + cold session pointers) on `startup|resume`.
 
 If you'd rather register the MCP server by hand, the wrapper script in `run_server.sh` honors `OLLAMA_MODEL` / `OLLAMA_URL` / `LLM_BACKEND` env vars before exec'ing `server.py`:
 
