@@ -76,13 +76,13 @@ Tests patch `db.DB_PATH` before calling `db.init_db()` to redirect to a test DB.
 
 - **`SessionStart` → `hook_handler.py inject-context`** — derives scope from `cwd` (basename of nearest `.git` toplevel, else basename of cwd, else `global`), reads top 3 by `(importance, updated_at) DESC` plus the next 5 most-recent unique IDs, prints them as a `hookSpecificOutput.additionalContext` bullet list. No LLM call. Also calls `_sweep()` before returning so SessionEnd misses don't strand buffers forever.
 - **`UserPromptSubmit` / `PostToolUse` → `hook_handler.py record --kind …`** — append a JSON line to `~/.claude/memory/sessions/<session_id>.jsonl`. Each `data` field is truncated to 500 bytes. Dumb, fast, no LLM.
-- **`SessionEnd` → `hook_handler.py summarize-session`** — read the buffer, skip if `< 3` records, otherwise call LLM with the transcript, parse `{session_summary, memories[]}`, and insert each via `tools._insert_memory` (so dedup/merge still applies). Delete the buffer.
+- **`SessionEnd` → `hook_handler.py summarize-session`** — read the buffer, skip if `< 3` records, otherwise call LLM with the transcript, parse `{session_summary, memories[], open_actions[]}`, and insert each via `tools._insert_memory` (memories dedup/merge via LLM metadata; open actions stored as `open_action`). Archive and delete the buffer.
 
 Every hook script ends with `exit 0`, and the Python entry wraps `main()` in `try/except Exception: pass` — a memory-agent fault cannot break a Claude Code session.
 
 ### Schema
 
-- Categories: `session_summary`, `code_decision`, `user_preference`, `project_knowledge` (normalized in `models/types.py`; unknown values fall back to `project_knowledge`).
+- Categories: `session_summary`, `code_decision`, `user_preference`, `project_knowledge`, `open_action` (normalized in `models/types.py`; unknown values fall back to `project_knowledge`).
 - Scope: project name (e.g. `arduino`) or `global`. Test scope is `__test__`.
 - Importance: 1–5 (5 = critical), clamped via Pydantic `BeforeValidator`.
 

@@ -22,6 +22,7 @@ from .models import MemoryRecord
 
 MAX_EVENT_BYTES = 500
 SESSION_STALE_SECONDS = 3600
+MAX_EXTRACTED_ITEMS = 3
 
 
 def _read_hook_input() -> dict:
@@ -146,6 +147,34 @@ def _build_transcript(events: list[dict]) -> str:
     return "\n".join(lines)
 
 
+def _parse_string_list(value: object) -> list[str]:
+    if not isinstance(value, list):
+        return []
+    out = []
+    for item in value:
+        if isinstance(item, str):
+            text = item.strip()
+            if text:
+                out.append(text)
+        if len(out) >= MAX_EXTRACTED_ITEMS:
+            break
+    return out
+
+
+def _parse_memory_item(item: object) -> tuple[str, str]:
+    if isinstance(item, str):
+        return item.strip(), ""
+    if isinstance(item, dict):
+        content = item.get("content", "")
+        if not isinstance(content, str):
+            content = ""
+        tags = item.get("tags", "")
+        if not isinstance(tags, str):
+            tags = ""
+        return content.strip(), tags.strip()
+    return "", ""
+
+
 def _llm_summarize(events: list[dict], scope: str) -> dict:
     transcript = _build_transcript(events)
     if not transcript:
@@ -157,7 +186,8 @@ def _llm_summarize(events: list[dict], scope: str) -> dict:
         "Respond with ONLY valid JSON:\n"
         "{\n"
         '  "session_summary": "1-3 sentences capturing what was accomplished — concrete enough to be useful next time the user opens this project. Empty string if nothing meaningful.",\n'
-        '  "memories": ["Specific code_decision, user_preference, or project_knowledge fact worth a separate memory. 0-3 items, short."]\n'
+        '  "memories": ["Specific code_decision, user_preference, or project_knowledge fact worth a separate memory. 0-3 items. Each item may be a string or {\"content\": \"...\", \"tags\": \"comma,tags\"}."],\n'
+        '  "open_actions": ["Short actionable todo not yet completed. 0-3 items. Empty array if none remain."]\n'
         "}"
     )
     user = f"Project scope: {scope}\n\nTranscript ({len(events)} events):\n{transcript}"
@@ -186,10 +216,13 @@ def _summarize_buffer(path: str, fallback_scope: str = "global") -> None:
     parsed = _llm_summarize(events, scope)
     summary = parsed.get("session_summary", "") if parsed else ""
     sub = parsed.get("memories", []) if parsed else []
+    open_actions = parsed.get("open_actions", []) if parsed else []
     if not isinstance(summary, str):
         summary = ""
     if not isinstance(sub, list):
         sub = []
+    if not isinstance(open_actions, list):
+        open_actions = []
 
     inserted = False
     conn = db.get_db()
@@ -200,18 +233,22 @@ def _summarize_buffer(path: str, fallback_scope: str = "global") -> None:
                 inserted = True
             except Exception:
                 pass
-        for item in sub[:3]:
-            content = ""
-            if isinstance(item, str):
-                content = item.strip()
-            elif isinstance(item, dict):
-                raw_content = item.get("content", "")
-                if isinstance(raw_content, str):
-                    content = raw_content.strip()
+        for item in sub[:MAX_EXTRACTED_ITEMS]:
+            content, tags = _parse_memory_item(item)
             if not content:
                 continue
             try:
-                tools._insert_memory(conn, content, scope, source)
+                tools._insert_memory(
+                    conn, content, scope, source, tags=tags
+                )
+                inserted = True
+            except Exception:
+                continue
+        for action in _parse_string_list(open_actions):
+            try:
+                tools._insert_memory(
+                    conn, action, scope, source, category="open_action"
+                )
                 inserted = True
             except Exception:
                 continue

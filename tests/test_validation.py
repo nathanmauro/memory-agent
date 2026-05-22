@@ -231,13 +231,11 @@ def test_memory_timeline_orders_and_filters() -> None:
         )
 
 
-def test_hook_summarize_inserts_memory() -> None:
-    reset_db()
-    session_id = "test-session-001"
+def _write_summarize_buffer(session_id: str, event_count: int = 4) -> str:
     buffer_path = os.path.join(db.SESSIONS_DIR, f"{session_id}.jsonl")
     os.makedirs(db.SESSIONS_DIR, exist_ok=True)
     with open(buffer_path, "w") as f:
-        for i in range(4):
+        for i in range(event_count):
             event = {
                 "ts": datetime.now(timezone.utc).isoformat(),
                 "kind": "prompt" if i % 2 == 0 else "tool_use",
@@ -247,10 +245,18 @@ def test_hook_summarize_inserts_memory() -> None:
                 else {"tool_name": "Bash", "tool_input": {"cmd": f"cmd {i}"}},
             }
             f.write(json.dumps(event) + "\n")
+    return buffer_path
+
+
+def test_hook_summarize_inserts_memory() -> None:
+    reset_db()
+    session_id = "test-session-001"
+    buffer_path = _write_summarize_buffer(session_id)
 
     summary_payload = {
         "session_summary": "User implemented hook auto-capture",
         "memories": ["Use SQLite + FTS5, no embeddings"],
+        "open_actions": [],
     }
     llm.llm_call = lambda system, user: json.dumps(summary_payload)
 
@@ -284,6 +290,99 @@ def test_hook_summarize_inserts_memory() -> None:
             "hook_summarize_inserts_memory",
             f"buffer_gone={buffer_gone} archive={archive_exists} "
             f"indexed={bool(archive_rows)} contents={contents}",
+        )
+
+
+def test_hook_summarize_stores_open_actions() -> None:
+    reset_db()
+    session_id = "test-session-open-actions"
+    buffer_path = _write_summarize_buffer(session_id)
+
+    summary_payload = {
+        "session_summary": "Refactored summarizer",
+        "memories": [],
+        "open_actions": [
+            "Add integration tests for open_action extraction",
+            "Update README category list",
+        ],
+    }
+    llm.llm_call = lambda system, user: json.dumps(summary_payload)
+
+    hook_handler._summarize_buffer(buffer_path, fallback_scope="__validation__")
+
+    conn = db.get_db()
+    rows = conn.execute(
+        """
+        SELECT content, category FROM memories
+        WHERE scope = ? AND category = 'open_action'
+        ORDER BY content
+        """,
+        ("__validation__",),
+    ).fetchall()
+    conn.close()
+    contents = [r["content"] for r in rows]
+
+    if (
+        len(contents) == 2
+        and "Add integration tests for open_action extraction" in contents
+        and "Update README category list" in contents
+    ):
+        ok("hook_summarize_stores_open_actions")
+    else:
+        fail(
+            "hook_summarize_stores_open_actions",
+            f"open_action rows={[(r['content'], r['category']) for r in rows]}",
+        )
+
+
+def test_hook_summarize_handles_noisy_open_actions() -> None:
+    reset_db()
+    session_id = "test-session-noisy-actions"
+    buffer_path = _write_summarize_buffer(session_id)
+
+    summary_payload = {
+        "session_summary": "Worked on parser hardening",
+        "memories": ["Keep defensive parsing"],
+        "open_actions": "not-a-list",
+    }
+    llm.llm_call = lambda system, user: json.dumps(summary_payload)
+
+    hook_handler._summarize_buffer(buffer_path, fallback_scope="__validation__")
+
+    conn = db.get_db()
+    open_rows = conn.execute(
+        "SELECT COUNT(*) AS n FROM memories WHERE category = 'open_action'"
+    ).fetchone()["n"]
+    all_rows = conn.execute("SELECT content FROM memories ORDER BY content").fetchall()
+    conn.close()
+    contents = [r["content"] for r in all_rows]
+
+    if (
+        open_rows == 0
+        and "Worked on parser hardening" in contents
+        and "Keep defensive parsing" in contents
+    ):
+        ok("hook_summarize_handles_noisy_open_actions")
+    else:
+        fail(
+            "hook_summarize_handles_noisy_open_actions",
+            f"open_rows={open_rows} contents={contents}",
+        )
+
+
+def test_open_action_category_normalization() -> None:
+    from mcp_memory_agent.models.types import _normalize_category
+
+    if (
+        _normalize_category("OPEN_ACTION") == "open_action"
+        and _normalize_category("not_a_category") == "project_knowledge"
+    ):
+        ok("open_action_category_normalization")
+    else:
+        fail(
+            "open_action_category_normalization",
+            f"open={_normalize_category('OPEN_ACTION')} "
+            f"invalid={_normalize_category('not_a_category')}",
         )
 
 
@@ -359,6 +458,9 @@ if __name__ == "__main__":
         test_memory_get_full_and_prefix()
         test_memory_timeline_orders_and_filters()
         test_hook_summarize_inserts_memory()
+        test_hook_summarize_stores_open_actions()
+        test_hook_summarize_handles_noisy_open_actions()
+        test_open_action_category_normalization()
         test_hook_summarize_skips_short_buffer()
         test_memory_session_search_finds_archived_content()
     finally:

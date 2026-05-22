@@ -17,7 +17,7 @@ Exposes eight tools to the MCP client:
 | `memory_forget` | Delete a memory by full UUID or 8-char prefix. |
 | `memory_consolidate` | Ask the LLM to propose merge/delete/update actions over a scope's memories; applied best-effort. |
 
-Memories carry a `category` (`session_summary`, `code_decision`, `user_preference`, `project_knowledge`), a free-text `scope` (e.g. a project name or `global`), an `importance` (1–5), and tags.
+Memories carry a `category` (`session_summary`, `code_decision`, `user_preference`, `project_knowledge`, `open_action`), a free-text `scope` (e.g. a project name or `global`), an `importance` (1–5), and tags.
 
 The database lives at `~/.claude/memory/memory.db` (WAL mode).
 
@@ -83,7 +83,7 @@ claude mcp add -s user memory /absolute/path/to/run_server.sh
 | `SessionStart`     | `hooks/session_start.sh`        | Emits up to 8 past memories for the current scope as `additionalContext`. Also sweeps any orphaned session buffers older than 1 hour. No LLM call. |
 | `UserPromptSubmit` | `hooks/user_prompt_submit.sh`   | Appends the user prompt to a per-session JSONL buffer at `~/.claude/memory/sessions/<id>.jsonl`. |
 | `PostToolUse`      | `hooks/post_tool_use.sh`        | Appends the tool name + truncated input/output to the same buffer. |
-| `SessionEnd`       | `hooks/session_end.sh`          | LLM-summarizes the buffer into one `session_summary` plus up to three sub-memories, then deletes the buffer. |
+| `SessionEnd`       | `hooks/session_end.sh`          | LLM-summarizes the buffer into one `session_summary`, up to three sub-memories, and up to three `open_action` items, then deletes the buffer. |
 
 Scope is derived from the session's `cwd`: basename of the nearest `.git` toplevel, else basename of `cwd`, else `global`. Every hook is wrapped to exit 0 on failure — a memory-agent fault cannot break a Claude Code session.
 

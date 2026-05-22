@@ -139,7 +139,7 @@ def extract_memory_metadata(
         existing_text = "\n".join(lines)
 
     system = """You are a memory management agent. Given a new memory and existing memories, you must:
-1. Categorize it as one of: session_summary, code_decision, user_preference, project_knowledge
+1. Categorize it as one of: session_summary, code_decision, user_preference, project_knowledge, open_action
 2. Extract relevant tags (comma-separated, lowercase, short)
 3. Rate importance 1-5 (5=critical, 1=trivial)
 4. Check if it should MERGE with an existing memory (same topic, updated info)
