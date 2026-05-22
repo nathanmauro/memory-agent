@@ -627,6 +627,53 @@ def test_curator_runs_lifecycle_and_proposal() -> None:
         )
 
 
+def test_memory_session_get_returns_transcript() -> None:
+    reset_db()
+    session_id = "session-get-full-001"
+    archive_path = db.archive_session_path("__validation__", session_id)
+    os.makedirs(os.path.dirname(archive_path), exist_ok=True)
+    prompt_text = "unique thaw marker abc123"
+    with open(archive_path, "w") as f:
+        f.write(
+            json.dumps(
+                {
+                    "ts": datetime.now(timezone.utc).isoformat(),
+                    "kind": "prompt",
+                    "scope": "__validation__",
+                    "data": {"prompt": prompt_text},
+                }
+            )
+            + "\n"
+        )
+    conn = db.get_db()
+    db.upsert_session_archive_index(
+        conn,
+        session_id,
+        "__validation__",
+        datetime.now(timezone.utc).isoformat(),
+        archive_path,
+        db.build_archive_index_text(archive_path),
+    )
+    conn.commit()
+    conn.close()
+
+    by_full = tools.memory_session_get(session_id, scope="__validation__")
+    by_prefix = tools.memory_session_get(session_id[:8], scope="__validation__")
+    missing = tools.memory_session_get("deadbeef")
+
+    if (
+        prompt_text in by_full
+        and prompt_text in by_prefix
+        and "deadbeef" in missing.lower()
+    ):
+        ok("memory_session_get_returns_transcript")
+    else:
+        fail(
+            "memory_session_get_returns_transcript",
+            f"full={by_full[:120]} prefix={by_prefix[:120]} missing={missing!r}",
+        )
+
+
 def test_memory_session_search_finds_archived_content() -> None:
     reset_db()
     session_id = "archive-search-001"
@@ -683,6 +730,7 @@ if __name__ == "__main__":
         test_hot_edit_add_replace_remove()
         test_hot_edit_rejects_oversize()
         test_inject_includes_hot_memory()
+        test_memory_session_get_returns_transcript()
         test_memory_session_search_finds_archived_content()
     finally:
         restore_state()

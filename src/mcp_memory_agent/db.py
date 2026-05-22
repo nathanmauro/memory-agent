@@ -229,6 +229,71 @@ def resolve_memory_id(conn: sqlite3.Connection, id_or_prefix: str) -> str | None
     return row["id"] if row else None
 
 
+def resolve_session_id(conn: sqlite3.Connection, id_or_prefix: str) -> str | None:
+    id_or_prefix = (id_or_prefix or "").strip()
+    if not id_or_prefix:
+        return None
+    row = conn.execute(
+        "SELECT session_id FROM session_archive WHERE session_id = ?",
+        (id_or_prefix,),
+    ).fetchone()
+    if row:
+        return row["session_id"]
+    row = conn.execute(
+        "SELECT session_id FROM session_archive WHERE session_id LIKE ? LIMIT 1",
+        (f"{id_or_prefix}%",),
+    ).fetchone()
+    return row["session_id"] if row else None
+
+
+def format_archive_event(obj: dict) -> str:
+    kind = str(obj.get("kind", ""))
+    ts = str(obj.get("ts", ""))[:19]
+    data = obj.get("data", {}) if isinstance(obj.get("data"), dict) else {}
+    prefix = f"[{ts}] " if ts else ""
+    if kind == "prompt":
+        return f"{prefix}USER: {str(data.get('prompt', ''))[:800]}"
+    if kind == "tool_use":
+        tname = data.get("tool_name", "?")
+        try:
+            tinput = json.dumps(data.get("tool_input", {}))[:500]
+        except Exception:
+            tinput = ""
+        try:
+            tresp = json.dumps(data.get("tool_response", {}))[:500]
+        except Exception:
+            tresp = ""
+        line = f"{prefix}TOOL {tname}: {tinput}"
+        if tresp and tresp not in ("{}", "null"):
+            line += f"\n  → {tresp}"
+        return line
+    return f"{prefix}{kind}: {json.dumps(data)[:400]}"
+
+
+def read_archive_transcript(archive_path: str, limit: int = 500) -> str:
+    if not archive_path or not os.path.exists(archive_path):
+        return ""
+    lines = []
+    try:
+        with open(archive_path) as f:
+            for raw in f:
+                raw = raw.strip()
+                if not raw:
+                    continue
+                try:
+                    obj = json.loads(raw)
+                except Exception:
+                    lines.append(raw[:400])
+                    continue
+                if isinstance(obj, dict):
+                    lines.append(format_archive_event(obj))
+                if len(lines) >= limit:
+                    break
+    except Exception:
+        return ""
+    return "\n".join(lines)
+
+
 def iter_session_buffers(stale_seconds: int) -> Iterator[str]:
     if not os.path.isdir(SESSIONS_DIR):
         return

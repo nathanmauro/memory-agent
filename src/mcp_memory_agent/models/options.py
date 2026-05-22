@@ -52,3 +52,10 @@ class MemorySessionSearchOptions(BaseModel):
     query: StrippedText
     scope: StrippedText = ""
     limit: ListLimit = 10
+
+
+class MemorySessionGetOptions(BaseModel):
+    """Validated options for the memory_session_get tool."""
+
+    session_id: StrippedText
+    scope: StrippedText = ""

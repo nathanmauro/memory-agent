@@ -15,6 +15,7 @@ from .models import (
     MemoryQueryOptions,
     MemoryRecord,
     MemorySessionSearchOptions,
+    MemorySessionGetOptions,
     MemoryTimelineOptions,
 )
 from .models.types import _normalize_category, _normalize_tags
@@ -416,6 +417,59 @@ def memory_session_search(query: str, scope: str = "", limit: int = 10) -> str:
             f"{hit['snippet']}"
         )
     return f"{len(hits)} archived sessions:\n" + "\n".join(lines)
+
+
+@mcp.tool()
+def memory_session_get(session_id: str, scope: str = "") -> str:
+    """Fetch the full archived transcript for a session (thaw cold storage).
+
+    Args:
+        session_id: Archived session ID (full or prefix match)
+        scope: Optional scope filter when resolving ambiguous prefixes
+    """
+    try:
+        options = MemorySessionGetOptions(session_id=session_id, scope=scope)
+    except Exception:
+        options = MemorySessionGetOptions(session_id=str(session_id))
+
+    conn = db.get_db()
+    resolved = db.resolve_session_id(conn, options.session_id)
+    if not resolved:
+        conn.close()
+        return f"No archived session found matching '{options.session_id}'."
+
+    params: list = [resolved]
+    scope_filter = ""
+    if options.scope:
+        scope_filter = " AND scope = ?"
+        params.append(options.scope)
+
+    row = conn.execute(
+        f"""
+        SELECT session_id, scope, archived_at, archive_path
+        FROM session_archive
+        WHERE session_id = ?{scope_filter}
+        """,
+        params,
+    ).fetchone()
+    conn.close()
+
+    if not row:
+        return f"No archived session found matching '{options.session_id}'."
+
+    transcript = db.read_archive_transcript(str(row["archive_path"]))
+    if not transcript.strip():
+        return (
+            f"Session {row['session_id'][:8]} [{row['scope']}] "
+            f"archived {str(row['archived_at'])[:10]} — transcript empty or unreadable."
+        )
+
+    header = (
+        f"Session {row['session_id']} [{row['scope']}] "
+        f"archived {row['archived_at']}\n"
+        f"Source: {row['archive_path']}\n\n"
+    )
+    return header + transcript
 
 
 def _apply_consolidation_actions(
