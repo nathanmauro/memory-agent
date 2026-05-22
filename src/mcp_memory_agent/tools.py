@@ -6,7 +6,7 @@ from datetime import datetime, timezone
 
 from mcp.server.fastmcp import FastMCP
 
-from . import db, llm
+from . import db, hot, llm
 from .models import (
     ConsolidationResult,
     MemoryGetOptions,
@@ -417,6 +417,37 @@ def memory_session_search(query: str, scope: str = "", limit: int = 10) -> str:
         )
     return f"{len(hits)} archived sessions:\n" + "\n".join(lines)
 
+
+
+@mcp.tool()
+def memory_hot_read(scope: str = "global") -> str:
+    """Read the bounded hot memory file for a scope.
+
+    Args:
+        scope: Project scope name or global
+    """
+    text = hot.read_hot(scope)
+    if not text.strip():
+        return f"No hot memory for scope '{scope}'."
+    return text
+
+
+@mcp.tool()
+def memory_hot_edit(
+    scope: str,
+    operation: str,
+    content: str,
+    target: str = "",
+) -> str:
+    """Edit bounded hot memory for a scope (Hermes-style add/replace/remove).
+
+    Args:
+        scope: Project scope name or global
+        operation: add, replace, or remove
+        content: Text to add or replacement content
+        target: Substring to replace or remove; omit to replace entire file
+    """
+    return hot.edit_hot(scope, operation, content, target)
 
 
 @mcp.tool()

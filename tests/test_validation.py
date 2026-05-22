@@ -9,15 +9,17 @@ import shutil
 import tempfile
 from datetime import datetime, timedelta, timezone
 
-from mcp_memory_agent import db, hook_handler, llm, tools
+from mcp_memory_agent import db, hook_handler, hot, llm, tools
 
 PASS = 0
 FAIL = 0
 TEST_ROOT = os.path.join(tempfile.gettempdir(), "memory_validation_test")
 TEST_DB = os.path.join(TEST_ROOT, "memory.db")
 TEST_SESSIONS = os.path.join(TEST_ROOT, "sessions")
+TEST_HOT = os.path.join(TEST_ROOT, "hot")
 ORIGINAL_DB_PATH = db.DB_PATH
 ORIGINAL_SESSIONS_DIR = db.SESSIONS_DIR
+ORIGINAL_HOT_DIR = db.HOT_DIR
 ORIGINAL_LLM_CALL = llm.llm_call
 
 
@@ -38,12 +40,14 @@ def reset_db() -> None:
     os.makedirs(TEST_ROOT, exist_ok=True)
     db.DB_PATH = TEST_DB
     db.SESSIONS_DIR = TEST_SESSIONS
+    db.HOT_DIR = TEST_HOT
     db.init_db()
 
 
 def restore_state() -> None:
     db.DB_PATH = ORIGINAL_DB_PATH
     db.SESSIONS_DIR = ORIGINAL_SESSIONS_DIR
+    db.HOT_DIR = ORIGINAL_HOT_DIR
     llm.llm_call = ORIGINAL_LLM_CALL
     shutil.rmtree(TEST_ROOT, ignore_errors=True)
 
@@ -412,6 +416,100 @@ def test_hook_summarize_skips_short_buffer() -> None:
         )
 
 
+def test_hot_edit_add_replace_remove() -> None:
+    reset_db()
+    scope = "__validation__"
+
+    result = tools.memory_hot_edit(scope, "add", "alpha line")
+    if "Error" in result:
+        fail("hot_edit_add", result)
+        return
+    ok("hot_edit_add")
+
+    result = tools.memory_hot_edit(scope, "add", "beta line")
+    if "Error" in result:
+        fail("hot_edit_add_second", result)
+        return
+    ok("hot_edit_add_second")
+
+    dup = tools.memory_hot_edit(scope, "add", "alpha line")
+    if "duplicate" in dup.lower():
+        ok("hot_edit_rejects_duplicate")
+    else:
+        fail("hot_edit_rejects_duplicate", dup)
+
+    result = tools.memory_hot_edit(scope, "replace", "ALPHA", target="alpha")
+    if "Error" in result:
+        fail("hot_edit_replace", result)
+        return
+    ok("hot_edit_replace")
+
+    read_back = tools.memory_hot_read(scope)
+    if "ALPHA" in read_back and "beta line" in read_back:
+        ok("hot_read_after_replace")
+    else:
+        fail("hot_read_after_replace", read_back)
+
+    result = tools.memory_hot_edit(scope, "remove", "", target="beta line")
+    if "Error" in result:
+        fail("hot_edit_remove", result)
+        return
+    ok("hot_edit_remove")
+
+    read_back = tools.memory_hot_read(scope)
+    if "beta line" not in read_back and "ALPHA" in read_back:
+        ok("hot_read_after_remove")
+    else:
+        fail("hot_read_after_remove", read_back)
+
+
+def test_hot_edit_rejects_oversize() -> None:
+    reset_db()
+    scope = "__validation__"
+    big = "x" * (hot.HOT_MAX_CHARS + 1)
+    result = tools.memory_hot_edit(scope, "replace", big, target="")
+    if "exceed" in result.lower():
+        ok("hot_edit_rejects_oversize")
+    else:
+        fail("hot_edit_rejects_oversize", result[:120])
+
+
+def test_inject_includes_hot_memory() -> None:
+    reset_db()
+    scope = "__validation__"
+    marker = "unique-hot-marker-xyzzy"
+    tools.memory_hot_edit(scope, "replace", marker, target="")
+    insert_memory(
+        "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
+        "warm memory snippet for inject test",
+        scope=scope,
+        importance=5,
+    )
+
+    import io
+    import contextlib
+
+    payload = {"cwd": os.path.join(TEST_ROOT, scope)}
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        hook_handler._inject_context(payload)
+    raw = buf.getvalue().strip()
+    try:
+        out = json.loads(raw)
+        ctx = out["hookSpecificOutput"]["additionalContext"]
+    except Exception as e:
+        fail("inject_includes_hot_memory", f"bad json: {e} raw={raw[:200]}")
+        return
+
+    if marker in ctx and "warm memory snippet" in ctx:
+        ok("inject_includes_hot_memory")
+    elif marker in ctx:
+        ok("inject_includes_hot_memory")
+        fail("inject_includes_warm_memory", ctx[:300])
+    else:
+        fail("inject_includes_hot_memory", ctx[:300])
+
+
 def test_memory_session_search_finds_archived_content() -> None:
     reset_db()
     session_id = "archive-search-001"
@@ -462,6 +560,9 @@ if __name__ == "__main__":
         test_hook_summarize_handles_noisy_open_actions()
         test_open_action_category_normalization()
         test_hook_summarize_skips_short_buffer()
+        test_hot_edit_add_replace_remove()
+        test_hot_edit_rejects_oversize()
+        test_inject_includes_hot_memory()
         test_memory_session_search_finds_archived_content()
     finally:
         restore_state()
