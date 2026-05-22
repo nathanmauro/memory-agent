@@ -19,6 +19,7 @@ class MemoryListOptions(BaseModel):
 
     scope: StrippedText = ""
     category: StrippedText = ""
+    status: StrippedText = ""
     limit: ListLimit = 20
 
 

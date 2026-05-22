@@ -19,6 +19,10 @@ class MemoryRecord(BaseModel):
     updated_at: str = ""
     source: str = ""
     importance: int = 3
+    status: str = "active"
+    last_accessed_at: str = ""
+    access_count: int = 0
+    pinned: int = 0
 
     @classmethod
     def from_row(cls, row: sqlite3.Row) -> "MemoryRecord":
