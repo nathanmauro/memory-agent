@@ -4,7 +4,7 @@ An [MCP](https://modelcontextprotocol.io) server that gives Claude Code (or any 
 
 ## What it does
 
-Exposes eight tools to the MCP client:
+Exposes ten tools to the MCP client:
 
 | Tool | Purpose |
 |---|---|
@@ -16,6 +16,8 @@ Exposes eight tools to the MCP client:
 | `memory_timeline` | DB-only chronological view, optionally bounded by `before_iso` / `after_iso`. |
 | `memory_forget` | Delete a memory by full UUID or 8-char prefix. |
 | `memory_consolidate` | Ask the LLM to propose merge/delete/update actions over a scope's memories; applied best-effort. |
+| `memory_hot_read` | Read the bounded hot memory markdown file for a scope (~8k chars). |
+| `memory_hot_edit` | Hermes-style `add` / `replace` / `remove` edits to hot memory; rejects duplicates and oversize writes. |
 
 Memories carry a `category` (`session_summary`, `code_decision`, `user_preference`, `project_knowledge`, `open_action`), a free-text `scope` (e.g. a project name or `global`), an `importance` (1–5), and tags.
 

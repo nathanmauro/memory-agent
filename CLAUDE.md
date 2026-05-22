@@ -34,8 +34,9 @@ The codebase is small and procedural; `models/` is the only package.
 | File / Dir                | Role                                                          |
 |---------------------------|---------------------------------------------------------------|
 | `server.py`               | Entry point: `db.init_db()` then `mcp.run()`.                 |
-| `tools.py`                | `FastMCP` app + 8 `@mcp.tool()` handlers, plus `_insert_memory` / `_gather_candidates` shared helpers. |
-| `db.py`                   | SQLite path/init, FTS upsert/delete, query-term extraction, `SESSIONS_DIR`, `resolve_memory_id`, `iter_session_buffers`. |
+| `tools.py`                | `FastMCP` app + MCP tool handlers, plus `_insert_memory` / `_gather_candidates` shared helpers. |
+| `hot.py`                  | Per-scope hot memory files under `hot/{scope}.md` with ~8k cap and add/replace/remove edits. |
+| `db.py`                   | SQLite path/init, FTS upsert/delete, query-term extraction, `SESSIONS_DIR`, `HOT_DIR`, `resolve_memory_id`, `iter_session_buffers`. |
 | `llm.py`                  | LLM dispatch (Ollama / Bedrock), JSON extraction, ranking.    |
 | `hook_handler.py`         | Claude Code hook entrypoint: `inject-context`, `record`, `summarize-session`, `sweep`. Always exits 0. |
 | `hooks/*.sh`              | Thin shell wrappers wired into `~/.claude/settings.json` by `install.py`. |
@@ -74,7 +75,7 @@ Tests patch `db.DB_PATH` before calling `db.init_db()` to redirect to a test DB.
 
 `install.py` registers four entries in `~/.claude/settings.json`:
 
-- **`SessionStart` → `hook_handler.py inject-context`** — derives scope from `cwd` (basename of nearest `.git` toplevel, else basename of cwd, else `global`), reads top 3 by `(importance, updated_at) DESC` plus the next 5 most-recent unique IDs, prints them as a `hookSpecificOutput.additionalContext` bullet list. No LLM call. Also calls `_sweep()` before returning so SessionEnd misses don't strand buffers forever.
+- **`SessionStart` → `hook_handler.py inject-context`** — derives scope from `cwd`, injects the hot memory file first (up to ~8k chars), then fills the remaining budget with warm DB memories and cold archive pointers. No LLM call. Also calls `_sweep()` before returning so SessionEnd misses don't strand buffers forever.
 - **`UserPromptSubmit` / `PostToolUse` → `hook_handler.py record --kind …`** — append a JSON line to `~/.claude/memory/sessions/<session_id>.jsonl`. Each `data` field is truncated to 500 bytes. Dumb, fast, no LLM.
 - **`SessionEnd` → `hook_handler.py summarize-session`** — read the buffer, skip if `< 3` records, otherwise call LLM with the transcript, parse `{session_summary, memories[], open_actions[]}`, and insert each via `tools._insert_memory` (memories dedup/merge via LLM metadata; open actions stored as `open_action`). Archive and delete the buffer.
 

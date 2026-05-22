@@ -501,13 +501,14 @@ def test_inject_includes_hot_memory() -> None:
         fail("inject_includes_hot_memory", f"bad json: {e} raw={raw[:200]}")
         return
 
-    if marker in ctx and "warm memory snippet" in ctx:
-        ok("inject_includes_hot_memory")
-    elif marker in ctx:
-        ok("inject_includes_hot_memory")
-        fail("inject_includes_warm_memory", ctx[:300])
-    else:
+    if marker not in ctx:
         fail("inject_includes_hot_memory", ctx[:300])
+        return
+    ok("inject_includes_hot_memory")
+    if "warm memory snippet" in ctx:
+        ok("inject_includes_warm_memory")
+    else:
+        fail("inject_includes_warm_memory", ctx[:300])
 
 
 def test_memory_session_search_finds_archived_content() -> None:
