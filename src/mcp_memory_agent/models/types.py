@@ -9,6 +9,7 @@ VALID_CATEGORIES = {
     "code_decision",
     "user_preference",
     "project_knowledge",
+    "open_action",
 }
 
 

@@ -17,15 +17,50 @@ from .models import (
     MemorySessionSearchOptions,
     MemoryTimelineOptions,
 )
+from .models.types import _normalize_category, _normalize_tags
 
 mcp = FastMCP("memory-agent")
 
 
 def _insert_memory(
-    conn: sqlite3.Connection, content: str, scope: str, source: str
+    conn: sqlite3.Connection,
+    content: str,
+    scope: str,
+    source: str,
+    category: str = "",
+    tags: str = "",
 ) -> str:
     """Insert or merge a memory using LLM-derived metadata. Caller commits."""
     now = datetime.now(timezone.utc).isoformat()
+
+    if category.strip():
+        cat = _normalize_category(category)
+        tag_str = _normalize_tags(tags) if tags else ""
+        importance = 4 if cat == "open_action" else 3
+        mem_id = str(uuid.uuid4())
+        conn.execute(
+            """
+            INSERT INTO memories (
+                id, content, category, scope, tags, created_at, updated_at,
+                source, importance
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                mem_id,
+                content,
+                cat,
+                scope,
+                tag_str,
+                now,
+                now,
+                source,
+                importance,
+            ),
+        )
+        db.upsert_fts_memory(conn, mem_id, content, tag_str)
+        return (
+            f"Stored memory {mem_id} [{cat}] importance={importance} tags={tag_str}"
+        )
 
     rows = conn.execute(
         "SELECT id, content, category, tags, importance FROM memories WHERE scope = ? ORDER BY updated_at DESC LIMIT 30",
@@ -34,6 +69,8 @@ def _insert_memory(
     existing = [MemoryRecord.from_row(r) for r in rows]
 
     meta = llm.extract_memory_metadata(content, scope, existing)
+    if tags.strip():
+        meta.tags = _normalize_tags(tags)
 
     if meta.merge_with_id and meta.merged_content:
         conn.execute(
