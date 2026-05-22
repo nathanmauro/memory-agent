@@ -17,6 +17,7 @@ DB_PATH = os.path.join(DB_DIR, "memory.db")
 SESSIONS_DIR = os.path.join(DB_DIR, "sessions")
 ARCHIVE_DIR = os.path.join(DB_DIR, "archive")
 ARCHIVE_SESSIONS_DIR = os.path.join(ARCHIVE_DIR, "sessions")
+HOT_DIR = os.path.join(DB_DIR, "hot")
 STOP_WORDS = {
     "the",
     "a",
@@ -69,12 +70,13 @@ STOP_WORDS = {
 
 def configure_paths(memory_home: str) -> None:
     global DB_DIR, DB_PATH, SESSIONS_DIR
-    global ARCHIVE_DIR, ARCHIVE_SESSIONS_DIR
+    global ARCHIVE_DIR, ARCHIVE_SESSIONS_DIR, HOT_DIR
     DB_DIR = os.path.abspath(os.path.expanduser(memory_home or DEFAULT_MEMORY_HOME))
     DB_PATH = os.path.join(DB_DIR, "memory.db")
     SESSIONS_DIR = os.path.join(DB_DIR, "sessions")
     ARCHIVE_DIR = os.path.join(DB_DIR, "archive")
     ARCHIVE_SESSIONS_DIR = os.path.join(ARCHIVE_DIR, "sessions")
+    HOT_DIR = os.path.join(DB_DIR, "hot")
 
 
 def get_db() -> sqlite3.Connection:
@@ -101,6 +103,7 @@ def init_db() -> None:
     os.makedirs(DB_DIR, exist_ok=True)
     os.makedirs(SESSIONS_DIR, exist_ok=True)
     os.makedirs(ARCHIVE_SESSIONS_DIR, exist_ok=True)
+    os.makedirs(HOT_DIR, exist_ok=True)
     conn = get_db()
     conn.executescript("""
         CREATE TABLE IF NOT EXISTS memories (

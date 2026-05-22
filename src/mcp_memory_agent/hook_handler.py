@@ -17,12 +17,14 @@ import os
 import sys
 from datetime import datetime, timezone
 
-from . import db, llm, tools
+from . import db, hot, llm, tools
 from .models import MemoryRecord
 
 MAX_EVENT_BYTES = 500
 SESSION_STALE_SECONDS = 3600
 MAX_EXTRACTED_ITEMS = 3
+INJECT_BUDGET_CHARS = hot.HOT_MAX_CHARS
+WARM_BUDGET_RATIO = 0.7
 
 
 def _read_hook_input() -> dict:
@@ -259,48 +261,114 @@ def _summarize_buffer(path: str, fallback_scope: str = "global") -> None:
 
 
 
+def _session_summary_for_source(
+    conn, scope: str, session_id: str
+) -> str:
+    try:
+        row = conn.execute(
+            """
+            SELECT content FROM memories
+            WHERE scope = ? AND source = ? AND category = 'session_summary'
+            ORDER BY updated_at DESC LIMIT 1
+            """,
+            (scope, session_id),
+        ).fetchone()
+        if row:
+            return str(row["content"]).replace("\n", " ")[:120]
+    except Exception:
+        pass
+    return ""
+
+
 def _inject_context(payload: dict) -> None:
     scope = _derive_scope(payload.get("cwd", ""))
 
     _sweep()
 
+    body_parts: list[str] = []
+    used = 0
+
+    hot_text = hot.read_hot(scope).strip()
+    if hot_text:
+        hot_header = f"Hot memory (scope '{scope}'):\n"
+        hot_block = hot_header + hot_text
+        if len(hot_block) > INJECT_BUDGET_CHARS:
+            hot_block = hot_block[:INJECT_BUDGET_CHARS]
+        body_parts.append(hot_block.rstrip())
+        used = len(hot_block)
+
+    bullets: list[str] = []
+    pointer_lines: list[str] = []
+
     conn = db.get_db()
     try:
-        top_rows = conn.execute(
-            "SELECT * FROM memories WHERE scope = ? ORDER BY importance DESC, updated_at DESC LIMIT 3",
-            (scope,),
-        ).fetchall()
-        top = [MemoryRecord.from_row(r) for r in top_rows]
-        top_ids = {m.id for m in top}
-        recent_rows = conn.execute(
-            "SELECT * FROM memories WHERE scope = ? ORDER BY updated_at DESC LIMIT 8",
-            (scope,),
-        ).fetchall()
-        recent: list[MemoryRecord] = []
-        for r in recent_rows:
-            rec = MemoryRecord.from_row(r)
-            if rec.id not in top_ids:
-                recent.append(rec)
-                if len(recent) >= 5:
-                    break
+        remaining = max(0, INJECT_BUDGET_CHARS - used)
+        warm_budget = int(remaining * WARM_BUDGET_RATIO) if remaining > 0 else 0
+        if warm_budget > 0:
+            header = f"Past memories for scope '{scope}':\n"
+            warm_used = len(header)
+            if used + warm_used <= INJECT_BUDGET_CHARS:
+                rows = conn.execute(
+                    """
+                    SELECT * FROM memories
+                    WHERE scope = ?
+                    ORDER BY importance DESC, updated_at DESC
+                    """,
+                    (scope,),
+                ).fetchall()
+                for row in rows:
+                    m = MemoryRecord.from_row(row)
+                    snippet = m.content.replace("\n", " ")[:200]
+                    line = f"- [{m.id[:8]}] ({m.category}) {snippet}"
+                    line_len = len(line) + 1
+                    if warm_used + line_len > warm_budget:
+                        break
+                    bullets.append(line)
+                    warm_used += line_len
+                if bullets:
+                    body_parts.append(header + "\n".join(bullets))
+                    used += warm_used
+
+        remaining = INJECT_BUDGET_CHARS - used
+        if remaining > 120:
+            archives = db.list_recent_archived_sessions(conn, scope, limit=8)
+            if archives:
+                pointer_header = "\nArchived sessions (use memory_session_search to thaw):\n"
+                if used + len(pointer_header) <= INJECT_BUDGET_CHARS:
+                    pointer_used = len(pointer_header)
+                    for row in archives:
+                        session_id = row["session_id"]
+                        archived_at = str(row["archived_at"])[:10]
+                        summary = _session_summary_for_source(conn, scope, session_id)
+                        if summary:
+                            line = (
+                                f"- [{session_id[:8]}] {archived_at} — {summary}"
+                            )
+                        else:
+                            line = (
+                                f"- [{session_id[:8]}] {archived_at} — "
+                                "archived transcript"
+                            )
+                        line_len = len(line) + 1
+                        if pointer_used + line_len > remaining:
+                            break
+                        pointer_lines.append(line)
+                        pointer_used += line_len
+                    if pointer_lines:
+                        pointer_lines.insert(0, pointer_header.rstrip())
+                        body_parts.append("\n".join(pointer_lines))
     finally:
         conn.close()
 
-    memories = top + recent
-    if not memories:
+    if not body_parts:
         print(json.dumps({}))
         return
 
-    bullets = []
-    for m in memories:
-        snippet = m.content.replace("\n", " ")[:200]
-        bullets.append(f"- [{m.id[:8]}] ({m.category}) {snippet}")
-    body = f"Past memories for scope '{scope}':\n" + "\n".join(bullets)
-
+    body = "\n\n".join(body_parts)
     out = {
         "hookSpecificOutput": {
             "hookEventName": "SessionStart",
-            "additionalContext": body,
+            "additionalContext": body[:INJECT_BUDGET_CHARS],
         }
     }
     print(json.dumps(out))
