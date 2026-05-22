@@ -135,7 +135,7 @@ def test_memory_consolidate_ignores_invalid_actions() -> None:
         "summary": "updated one memory",
     }
     llm.llm_call = lambda system, user: json.dumps(payload)
-    result = tools.memory_consolidate("__validation__")
+    result = tools.memory_consolidate("__validation__", apply=True)
     conn = db.get_db()
     row = conn.execute(
         "SELECT content FROM memories WHERE id = ?",
@@ -445,6 +445,62 @@ def test_memory_access_tracking() -> None:
         fail("memory_access_tracking", f"row={dict(row) if row else None}")
 
 
+def test_memory_consolidate_dry_run_no_mutation() -> None:
+    reset_db()
+    insert_memory("11111111-1111-1111-1111-111111111111", "keep me")
+    payload = {
+        "actions": [
+            {
+                "type": "delete",
+                "id": "11111111-1111-1111-1111-111111111111",
+                "reason": "test",
+            }
+        ],
+        "summary": "would delete",
+    }
+    llm.llm_call = lambda system, user: json.dumps(payload)
+    result = tools.memory_consolidate("__validation__", apply=False)
+    conn = db.get_db()
+    row = conn.execute(
+        "SELECT content FROM memories WHERE id = ?",
+        ("11111111-1111-1111-1111-111111111111",),
+    ).fetchone()
+    conn.close()
+    if row and row["content"] == "keep me" and "Proposal written to" in result:
+        ok("memory_consolidate_dry_run_no_mutation")
+    else:
+        fail("memory_consolidate_dry_run_no_mutation", result)
+
+
+def test_memory_consolidate_apply_writes_backup() -> None:
+    reset_db()
+    insert_memory("22222222-2222-2222-2222-222222222222", "old")
+    payload = {
+        "actions": [
+            {
+                "type": "update",
+                "id": "22222222-2222-2222-2222-222222222222",
+                "new_content": "new",
+            }
+        ],
+        "summary": "updated",
+    }
+    llm.llm_call = lambda system, user: json.dumps(payload)
+    result = tools.memory_consolidate("__validation__", apply=True)
+    conn = db.get_db()
+    row = conn.execute(
+        "SELECT content FROM memories WHERE id = ?",
+        ("22222222-2222-2222-2222-222222222222",),
+    ).fetchone()
+    conn.close()
+    backups = os.listdir(db.BACKUPS_DIR) if os.path.isdir(db.BACKUPS_DIR) else []
+    if row and row["content"] == "new" and backups and "Backup:" in result:
+        ok("memory_consolidate_apply_writes_backup")
+    else:
+        fail(
+            "memory_consolidate_apply_writes_backup",
+            f"result={result} backups={backups}",
+        )
 
 
 def test_inject_context_respects_active_status() -> None:
@@ -504,7 +560,9 @@ if __name__ == "__main__":
         test_codex_hook_merge_preserves_existing()
         test_memory_session_search_finds_archived_content()
         test_memory_access_tracking()
-test_inject_context_respects_active_status()
+        test_memory_consolidate_dry_run_no_mutation()
+        test_memory_consolidate_apply_writes_backup()
+        test_inject_context_respects_active_status()
     finally:
         restore_state()
 
