@@ -257,16 +257,24 @@ def test_hook_summarize_inserts_memory() -> None:
     hook_handler._summarize_buffer(buffer_path, fallback_scope="__validation__")
 
     buffer_gone = not os.path.exists(buffer_path)
+    archive_path = db.archive_session_path("__validation__", session_id)
+    archive_exists = os.path.exists(archive_path)
     conn = db.get_db()
     rows = conn.execute(
         "SELECT content FROM memories WHERE scope = ? ORDER BY content",
         ("__validation__",),
+    ).fetchall()
+    archive_rows = conn.execute(
+        "SELECT session_id FROM session_archive WHERE session_id = ?",
+        (session_id,),
     ).fetchall()
     conn.close()
     contents = [r["content"] for r in rows]
 
     if (
         buffer_gone
+        and archive_exists
+        and archive_rows
         and "User implemented hook auto-capture" in contents
         and "Use SQLite + FTS5, no embeddings" in contents
     ):
@@ -274,7 +282,8 @@ def test_hook_summarize_inserts_memory() -> None:
     else:
         fail(
             "hook_summarize_inserts_memory",
-            f"buffer_gone={buffer_gone} contents={contents}",
+            f"buffer_gone={buffer_gone} archive={archive_exists} "
+            f"indexed={bool(archive_rows)} contents={contents}",
         )
 
 
@@ -304,6 +313,42 @@ def test_hook_summarize_skips_short_buffer() -> None:
         )
 
 
+def test_memory_session_search_finds_archived_content() -> None:
+    reset_db()
+    session_id = "archive-search-001"
+    archive_path = db.archive_session_path("__validation__", session_id)
+    os.makedirs(os.path.dirname(archive_path), exist_ok=True)
+    with open(archive_path, "w") as f:
+        f.write(
+            json.dumps(
+                {
+                    "ts": datetime.now(timezone.utc).isoformat(),
+                    "kind": "prompt",
+                    "scope": "__validation__",
+                    "data": {"prompt": "unique glacier keyword xyzzy"},
+                }
+            )
+            + "\n"
+        )
+    conn = db.get_db()
+    db.upsert_session_archive_index(
+        conn,
+        session_id,
+        "__validation__",
+        datetime.now(timezone.utc).isoformat(),
+        archive_path,
+        db.build_archive_index_text(archive_path),
+    )
+    conn.commit()
+    conn.close()
+
+    result = tools.memory_session_search("xyzzy", scope="__validation__", limit=5)
+    if "xyzzy" in result.lower() and "__validation__" in result:
+        ok("memory_session_search_finds_archived_content")
+    else:
+        fail("memory_session_search_finds_archived_content", result)
+
+
 if __name__ == "__main__":
     try:
         test_extract_memory_metadata_defaults()
@@ -315,6 +360,7 @@ if __name__ == "__main__":
         test_memory_timeline_orders_and_filters()
         test_hook_summarize_inserts_memory()
         test_hook_summarize_skips_short_buffer()
+        test_memory_session_search_finds_archived_content()
     finally:
         restore_state()
 

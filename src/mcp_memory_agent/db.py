@@ -1,14 +1,22 @@
 """Database helpers for the memory agent."""
 
+import json
 import os
 import re
+import shutil
 import sqlite3
 import time
 from collections.abc import Iterator
+from datetime import datetime, timezone
 
-DB_DIR = os.path.join(os.path.expanduser("~"), ".claude", "memory")
+DEFAULT_MEMORY_HOME = os.path.join(os.path.expanduser("~"), ".claude", "memory")
+DB_DIR = os.path.abspath(
+    os.path.expanduser(os.environ.get("MEMORY_AGENT_HOME", DEFAULT_MEMORY_HOME))
+)
 DB_PATH = os.path.join(DB_DIR, "memory.db")
 SESSIONS_DIR = os.path.join(DB_DIR, "sessions")
+ARCHIVE_DIR = os.path.join(DB_DIR, "archive")
+ARCHIVE_SESSIONS_DIR = os.path.join(ARCHIVE_DIR, "sessions")
 STOP_WORDS = {
     "the",
     "a",
@@ -59,6 +67,16 @@ STOP_WORDS = {
 }
 
 
+def configure_paths(memory_home: str) -> None:
+    global DB_DIR, DB_PATH, SESSIONS_DIR
+    global ARCHIVE_DIR, ARCHIVE_SESSIONS_DIR
+    DB_DIR = os.path.abspath(os.path.expanduser(memory_home or DEFAULT_MEMORY_HOME))
+    DB_PATH = os.path.join(DB_DIR, "memory.db")
+    SESSIONS_DIR = os.path.join(DB_DIR, "sessions")
+    ARCHIVE_DIR = os.path.join(DB_DIR, "archive")
+    ARCHIVE_SESSIONS_DIR = os.path.join(ARCHIVE_DIR, "sessions")
+
+
 def get_db() -> sqlite3.Connection:
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
@@ -66,9 +84,23 @@ def get_db() -> sqlite3.Connection:
     return conn
 
 
+def _ensure_column(
+    conn: sqlite3.Connection, table: str, column: str, definition: str
+) -> None:
+    cols = [row[1] for row in conn.execute(f"PRAGMA table_info({table})").fetchall()]
+    if column not in cols:
+        conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
+
+
+def _safe_path_component(value: str) -> str:
+    safe = "".join(c for c in value if c.isalnum() or c in "-_")
+    return safe or "global"
+
+
 def init_db() -> None:
     os.makedirs(DB_DIR, exist_ok=True)
     os.makedirs(SESSIONS_DIR, exist_ok=True)
+    os.makedirs(ARCHIVE_SESSIONS_DIR, exist_ok=True)
     conn = get_db()
     conn.executescript("""
         CREATE TABLE IF NOT EXISTS memories (
@@ -85,11 +117,34 @@ def init_db() -> None:
 
         CREATE INDEX IF NOT EXISTS idx_memories_scope ON memories(scope);
         CREATE INDEX IF NOT EXISTS idx_memories_category ON memories(category);
+
+        CREATE TABLE IF NOT EXISTS session_archive (
+            session_id TEXT PRIMARY KEY,
+            scope TEXT NOT NULL,
+            archived_at TEXT NOT NULL,
+            archive_path TEXT NOT NULL,
+            index_text TEXT NOT NULL DEFAULT ''
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_session_archive_scope ON session_archive(scope);
+        CREATE INDEX IF NOT EXISTS idx_session_archive_archived_at ON session_archive(archived_at);
     """)
     try:
         conn.execute("""
             CREATE VIRTUAL TABLE IF NOT EXISTS memories_fts
             USING fts5(id UNINDEXED, content, tags)
+        """)
+    except sqlite3.OperationalError:
+        pass
+    try:
+        conn.execute("""
+            CREATE VIRTUAL TABLE IF NOT EXISTS session_archive_fts
+            USING fts5(
+                session_id UNINDEXED,
+                scope UNINDEXED,
+                archived_at UNINDEXED,
+                content
+            )
         """)
     except sqlite3.OperationalError:
         pass
@@ -165,3 +220,228 @@ def iter_session_buffers(stale_seconds: int) -> Iterator[str]:
                 yield path
         except OSError:
             continue
+
+
+def archive_session_path(scope: str, session_id: str) -> str:
+    scope_dir = os.path.join(ARCHIVE_SESSIONS_DIR, _safe_path_component(scope))
+    os.makedirs(scope_dir, exist_ok=True)
+    safe_id = _safe_path_component(session_id)
+    return os.path.join(scope_dir, f"{safe_id}.jsonl")
+
+
+def flatten_archive_line(line: str) -> str:
+    line = line.strip()
+    if not line:
+        return ""
+    try:
+        obj = json.loads(line)
+    except Exception:
+        return line[:400]
+    if not isinstance(obj, dict):
+        return str(obj)[:400]
+    kind = str(obj.get("kind", ""))
+    data = obj.get("data", {})
+    parts = [kind]
+    if isinstance(data, dict):
+        for value in data.values():
+            if isinstance(value, str):
+                parts.append(value[:300])
+            else:
+                try:
+                    parts.append(json.dumps(value)[:300])
+                except Exception:
+                    parts.append(str(value)[:300])
+    return " ".join(part for part in parts if part)
+
+
+def build_archive_index_text(archive_path: str) -> str:
+    lines = []
+    try:
+        with open(archive_path) as f:
+            for raw in f:
+                flat = flatten_archive_line(raw)
+                if flat:
+                    lines.append(flat)
+    except Exception:
+        return ""
+    return "\n".join(lines)
+
+
+def delete_session_archive_fts(conn: sqlite3.Connection, session_id: str) -> None:
+    try:
+        conn.execute(
+            "DELETE FROM session_archive_fts WHERE session_id = ?", (session_id,)
+        )
+    except sqlite3.OperationalError:
+        pass
+
+
+def upsert_session_archive_index(
+    conn: sqlite3.Connection,
+    session_id: str,
+    scope: str,
+    archived_at: str,
+    archive_path: str,
+    index_text: str,
+) -> None:
+    conn.execute(
+        """
+        INSERT INTO session_archive (session_id, scope, archived_at, archive_path, index_text)
+        VALUES (?, ?, ?, ?, ?)
+        ON CONFLICT(session_id) DO UPDATE SET
+            scope = excluded.scope,
+            archived_at = excluded.archived_at,
+            archive_path = excluded.archive_path,
+            index_text = excluded.index_text
+        """,
+        (session_id, scope, archived_at, archive_path, index_text),
+    )
+    delete_session_archive_fts(conn, session_id)
+    try:
+        conn.execute(
+            """
+            INSERT INTO session_archive_fts (session_id, scope, archived_at, content)
+            VALUES (?, ?, ?, ?)
+            """,
+            (session_id, scope, archived_at, index_text),
+        )
+    except sqlite3.OperationalError:
+        pass
+
+
+def archive_session_buffer(
+    buffer_path: str, scope: str, session_id: str | None = None
+) -> str | None:
+    if not os.path.exists(buffer_path):
+        return None
+    if not session_id:
+        session_id = os.path.basename(buffer_path).replace(".jsonl", "")
+    if not session_id:
+        return None
+
+    archive_path = archive_session_path(scope, session_id)
+    try:
+        os.replace(buffer_path, archive_path)
+    except Exception:
+        try:
+            shutil.copy2(buffer_path, archive_path)
+            os.remove(buffer_path)
+        except Exception:
+            return None
+
+    archived_at = datetime.now(timezone.utc).isoformat()
+    index_text = build_archive_index_text(archive_path)
+    conn = get_db()
+    try:
+        upsert_session_archive_index(
+            conn, session_id, scope, archived_at, archive_path, index_text
+        )
+        conn.commit()
+    except Exception:
+        pass
+    finally:
+        conn.close()
+    return archive_path
+
+
+def list_recent_archived_sessions(
+    conn: sqlite3.Connection, scope: str, limit: int = 10
+) -> list[sqlite3.Row]:
+    try:
+        rows = conn.execute(
+            """
+            SELECT session_id, scope, archived_at, archive_path
+            FROM session_archive
+            WHERE scope = ?
+            ORDER BY archived_at DESC
+            LIMIT ?
+            """,
+            (scope, max(1, min(limit, 50))),
+        ).fetchall()
+        return list(rows)
+    except Exception:
+        return []
+
+
+def search_session_archive(
+    conn: sqlite3.Connection, query: str, scope: str = "", limit: int = 10
+) -> list[dict]:
+    limit = max(1, min(limit, 50))
+    hits: list[dict] = []
+    seen: set[str] = set()
+
+    try:
+        words = extract_search_terms(query, 10)
+        if words:
+            fts_query = " OR ".join(words)
+            scope_filter = ""
+            params: list = [fts_query]
+            if scope:
+                scope_filter = " AND scope = ?"
+                params.append(scope)
+            rows = conn.execute(
+                f"""
+                SELECT session_id, scope, archived_at, content
+                FROM session_archive_fts
+                WHERE session_archive_fts MATCH ?{scope_filter}
+                ORDER BY rank
+                LIMIT ?
+                """,
+                params + [limit],
+            ).fetchall()
+            for row in rows:
+                sid = row["session_id"]
+                if sid in seen:
+                    continue
+                seen.add(sid)
+                snippet = str(row["content"]).replace("\n", " ")[:200]
+                hits.append(
+                    {
+                        "session_id": sid,
+                        "scope": row["scope"],
+                        "archived_at": row["archived_at"],
+                        "snippet": snippet,
+                    }
+                )
+    except sqlite3.OperationalError:
+        pass
+
+    if len(hits) < limit:
+        like_words = extract_search_terms(query, 5)
+        conditions = []
+        params = []
+        if scope:
+            conditions.append("scope = ?")
+            params.append(scope)
+        for word in like_words:
+            conditions.append("index_text LIKE ?")
+            params.append(f"%{word}%")
+        where = "WHERE " + " AND ".join(conditions) if conditions else ""
+        rows = conn.execute(
+            f"""
+            SELECT session_id, scope, archived_at, index_text
+            FROM session_archive
+            {where}
+            ORDER BY archived_at DESC
+            LIMIT ?
+            """,
+            params + [limit],
+        ).fetchall()
+        for row in rows:
+            sid = row["session_id"]
+            if sid in seen:
+                continue
+            seen.add(sid)
+            snippet = str(row["index_text"]).replace("\n", " ")[:200]
+            hits.append(
+                {
+                    "session_id": sid,
+                    "scope": row["scope"],
+                    "archived_at": row["archived_at"],
+                    "snippet": snippet,
+                }
+            )
+            if len(hits) >= limit:
+                break
+    return hits[:limit]
+

@@ -178,7 +178,10 @@ def _summarize_buffer(path: str, fallback_scope: str = "global") -> None:
 
     scopes = [e.get("scope") for e in events if e.get("scope")]
     scope = scopes[0] if scopes else fallback_scope
-    source = os.path.basename(path).replace(".jsonl", "")
+    session_id = os.path.basename(path).replace(".jsonl", "")
+    source = session_id
+
+    db.archive_session_buffer(path, scope, session_id)
 
     parsed = _llm_summarize(events, scope)
     summary = parsed.get("session_summary", "") if parsed else ""
@@ -217,7 +220,6 @@ def _summarize_buffer(path: str, fallback_scope: str = "global") -> None:
     finally:
         conn.close()
 
-    _remove_buffer(path)
 
 
 def _inject_context(payload: dict) -> None:
