@@ -28,10 +28,10 @@ SETTINGS_PATH = os.path.join(os.path.expanduser("~"), ".claude", "settings.json"
 SETTINGS_BACKUP = SETTINGS_PATH + ".bak"
 
 HOOK_EVENTS = {
-    "SessionStart": ["inject-context"],
-    "UserPromptSubmit": ["record", "--kind", "prompt"],
-    "PostToolUse": ["record", "--kind", "tool_use"],
-    "SessionEnd": ["summarize-session"],
+    "SessionStart": [["inject-context"], ["curator"]],
+    "UserPromptSubmit": [["record", "--kind", "prompt"]],
+    "PostToolUse": [["record", "--kind", "tool_use"]],
+    "SessionEnd": [["summarize-session"]],
 }
 
 
@@ -142,25 +142,28 @@ def install_hooks() -> int:
     _backup_settings()
 
     added = 0
-    for event, args in HOOK_EVENTS.items():
-        command = _hook_command(args)
-        entries = hooks.get(event)
-        if not isinstance(entries, list):
-            entries = []
-            hooks[event] = entries
-        if any(
-            isinstance(e, dict) and _entry_has_command(e, command) for e in entries
-        ):
-            print(f"  exists: {event}")
-            continue
-        entries.append(
-            {
-                "matcher": "",
-                "hooks": [{"type": "command", "command": command}],
-            }
-        )
-        print(f"  added:  {event} -> {command}")
-        added += 1
+    for event, arg_lists in HOOK_EVENTS.items():
+        if arg_lists and isinstance(arg_lists[0], str):
+            arg_lists = [arg_lists]
+        for args in arg_lists:
+            command = _hook_command(args)
+            entries = hooks.get(event)
+            if not isinstance(entries, list):
+                entries = []
+                hooks[event] = entries
+            if any(
+                isinstance(e, dict) and _entry_has_command(e, command) for e in entries
+            ):
+                print(f"  exists: {event}")
+                continue
+            entries.append(
+                {
+                    "matcher": "",
+                    "hooks": [{"type": "command", "command": command}],
+                }
+            )
+            print(f"  added:  {event} -> {command}")
+            added += 1
 
     _save_settings(settings)
     return added
