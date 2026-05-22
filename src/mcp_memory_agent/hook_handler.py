@@ -6,6 +6,7 @@ Reads hook JSON from stdin. Subcommands:
   record             Append a transcript event to the per-session buffer.
   summarize-session  LLM-summarize the buffer on SessionEnd and persist memories.
   sweep              Summarize orphaned (stale) buffers and delete them.
+  curator            Weekly lifecycle transitions and dry-run consolidate proposals.
 
 Every code path is best-effort: failures are swallowed so that a memory-agent
 fault never breaks a Claude Code session.
@@ -311,7 +312,7 @@ def _inject_context(payload: dict) -> None:
                 rows = conn.execute(
                     """
                     SELECT * FROM memories
-                    WHERE scope = ?
+                    WHERE scope = ? AND status = 'active'
                     ORDER BY importance DESC, updated_at DESC
                     """,
                     (scope,),
@@ -390,6 +391,42 @@ def _sweep() -> None:
             _remove_buffer(path)
 
 
+def _curator_scopes(primary: str) -> list[str]:
+    scopes = [primary or "global"]
+    if primary and primary != "global":
+        scopes.append("global")
+    return scopes
+
+
+def _run_curator(scope: str) -> None:
+    scopes = _curator_scopes(scope)
+    conn = db.get_db()
+    try:
+        for item in scopes:
+            try:
+                db.apply_lifecycle_transitions(conn, item)
+            except Exception:
+                continue
+        conn.commit()
+    finally:
+        conn.close()
+
+    for item in scopes:
+        try:
+            tools.memory_consolidate(item, apply=False)
+        except Exception:
+            continue
+
+    db.write_curator_last_run(datetime.now(timezone.utc).isoformat())
+
+
+def _curator(payload: dict) -> None:
+    if not db.curator_due():
+        return
+    scope = _derive_scope(payload.get("cwd", ""))
+    _run_curator(scope)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     sub = parser.add_subparsers(dest="cmd", required=True)
@@ -398,6 +435,7 @@ def main() -> None:
     record.add_argument("--kind", choices=["prompt", "tool_use"], required=True)
     sub.add_parser("summarize-session")
     sub.add_parser("sweep")
+    sub.add_parser("curator")
 
     args = parser.parse_args()
     payload = _read_hook_input()
@@ -411,6 +449,8 @@ def main() -> None:
         _summarize_session(payload)
     elif args.cmd == "sweep":
         _sweep()
+    elif args.cmd == "curator":
+        _curator(payload)
 
 
 if __name__ == "__main__":

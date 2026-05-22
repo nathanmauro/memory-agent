@@ -17,9 +17,15 @@ TEST_ROOT = os.path.join(tempfile.gettempdir(), "memory_validation_test")
 TEST_DB = os.path.join(TEST_ROOT, "memory.db")
 TEST_SESSIONS = os.path.join(TEST_ROOT, "sessions")
 TEST_HOT = os.path.join(TEST_ROOT, "hot")
+TEST_PROPOSALS = os.path.join(TEST_ROOT, "proposals")
+TEST_BACKUPS = os.path.join(TEST_ROOT, "backups")
+TEST_CURATOR_LAST_RUN = os.path.join(TEST_ROOT, "curator_last_run.txt")
 ORIGINAL_DB_PATH = db.DB_PATH
 ORIGINAL_SESSIONS_DIR = db.SESSIONS_DIR
 ORIGINAL_HOT_DIR = db.HOT_DIR
+ORIGINAL_PROPOSALS_DIR = db.PROPOSALS_DIR
+ORIGINAL_BACKUPS_DIR = db.BACKUPS_DIR
+ORIGINAL_CURATOR_LAST_RUN_PATH = db.CURATOR_LAST_RUN_PATH
 ORIGINAL_LLM_CALL = llm.llm_call
 
 
@@ -41,6 +47,9 @@ def reset_db() -> None:
     db.DB_PATH = TEST_DB
     db.SESSIONS_DIR = TEST_SESSIONS
     db.HOT_DIR = TEST_HOT
+    db.PROPOSALS_DIR = TEST_PROPOSALS
+    db.BACKUPS_DIR = TEST_BACKUPS
+    db.CURATOR_LAST_RUN_PATH = TEST_CURATOR_LAST_RUN
     db.init_db()
 
 
@@ -48,6 +57,9 @@ def restore_state() -> None:
     db.DB_PATH = ORIGINAL_DB_PATH
     db.SESSIONS_DIR = ORIGINAL_SESSIONS_DIR
     db.HOT_DIR = ORIGINAL_HOT_DIR
+    db.PROPOSALS_DIR = ORIGINAL_PROPOSALS_DIR
+    db.BACKUPS_DIR = ORIGINAL_BACKUPS_DIR
+    db.CURATOR_LAST_RUN_PATH = ORIGINAL_CURATOR_LAST_RUN_PATH
     llm.llm_call = ORIGINAL_LLM_CALL
     shutil.rmtree(TEST_ROOT, ignore_errors=True)
 
@@ -138,7 +150,7 @@ def test_memory_consolidate_ignores_invalid_actions() -> None:
         "summary": "updated one memory",
     }
     llm.llm_call = lambda system, user: json.dumps(payload)
-    result = tools.memory_consolidate("__validation__")
+    result = tools.memory_consolidate("__validation__", apply=True)
     conn = db.get_db()
     row = conn.execute(
         "SELECT content FROM memories WHERE id = ?",
@@ -510,6 +522,111 @@ def test_inject_includes_hot_memory() -> None:
         fail("inject_includes_hot_memory", ctx[:300])
 
 
+def test_memory_consolidate_dry_run_by_default() -> None:
+    reset_db()
+    insert_memory("11111111-1111-1111-1111-111111111111", "old content")
+    payload = {
+        "actions": [
+            {
+                "type": "update",
+                "id": "11111111-1111-1111-1111-111111111111",
+                "new_content": "new content",
+            },
+        ],
+        "summary": "proposed update",
+    }
+    llm.llm_call = lambda system, user: json.dumps(payload)
+    result = tools.memory_consolidate("__validation__")
+    conn = db.get_db()
+    row = conn.execute(
+        "SELECT content FROM memories WHERE id = ?",
+        ("11111111-1111-1111-1111-111111111111",),
+    ).fetchone()
+    conn.close()
+    proposal_files = os.listdir(TEST_PROPOSALS) if os.path.isdir(TEST_PROPOSALS) else []
+    if (
+        row
+        and row["content"] == "old content"
+        and "Proposal written" in result
+        and proposal_files
+    ):
+        ok("memory_consolidate_dry_run_by_default")
+    else:
+        fail(
+            "memory_consolidate_dry_run_by_default",
+            f"result={result} content={row['content'] if row else None} "
+            f"proposals={proposal_files}",
+        )
+
+
+def test_curator_skips_within_interval() -> None:
+    reset_db()
+    db.write_curator_last_run(datetime.now(timezone.utc).isoformat())
+    calls = {"count": 0}
+    llm.llm_call = lambda s, u: (calls.update(count=calls["count"] + 1) or "{}")
+
+    hook_handler._curator({"cwd": TEST_ROOT})
+
+    if calls["count"] == 0:
+        ok("curator_skips_within_interval")
+    else:
+        fail("curator_skips_within_interval", f"llm calls={calls['count']}")
+
+
+def test_curator_runs_lifecycle_and_proposal() -> None:
+    reset_db()
+    old = (datetime.now(timezone.utc) - timedelta(days=40)).isoformat()
+    conn = db.get_db()
+    conn.execute(
+        """
+        INSERT INTO memories (
+            id, content, category, scope, tags, created_at, updated_at,
+            source, importance, status, last_accessed_at, access_count, pinned
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            "99999999-9999-9999-9999-999999999999",
+            "stale candidate",
+            "project_knowledge",
+            "__validation__",
+            "",
+            old,
+            old,
+            "test",
+            2,
+            "active",
+            "",
+            0,
+            0,
+        ),
+    )
+    conn.commit()
+    conn.close()
+
+    payload = {"actions": [], "summary": "all clean"}
+    llm.llm_call = lambda system, user: json.dumps(payload)
+
+    hook_handler._curator({"cwd": os.path.join(TEST_ROOT, "__validation__")})
+
+    conn = db.get_db()
+    row = conn.execute(
+        "SELECT status FROM memories WHERE id = ?",
+        ("99999999-9999-9999-9999-999999999999",),
+    ).fetchone()
+    conn.close()
+    last_run = db.read_curator_last_run()
+    proposal_files = os.listdir(TEST_PROPOSALS) if os.path.isdir(TEST_PROPOSALS) else []
+
+    if row and row["status"] == "stale" and last_run and proposal_files:
+        ok("curator_runs_lifecycle_and_proposal")
+    else:
+        fail(
+            "curator_runs_lifecycle_and_proposal",
+            f"status={row['status'] if row else None} last_run={last_run!r} "
+            f"proposals={proposal_files}",
+        )
+
+
 def test_memory_session_search_finds_archived_content() -> None:
     reset_db()
     session_id = "archive-search-001"
@@ -552,6 +669,9 @@ if __name__ == "__main__":
         test_extract_memory_metadata_normalizes_values()
         test_memory_query_clamps_limit()
         test_memory_consolidate_ignores_invalid_actions()
+        test_memory_consolidate_dry_run_by_default()
+        test_curator_skips_within_interval()
+        test_curator_runs_lifecycle_and_proposal()
         test_memory_index_no_llm_call()
         test_memory_get_full_and_prefix()
         test_memory_timeline_orders_and_filters()
