@@ -102,16 +102,43 @@ def llm_call(system: str, user: str) -> str:
     return _ollama_call(system, user)
 
 
+def _strip_fences(raw: str) -> str:
+    s = raw.strip()
+    if s.startswith("```"):
+        first_nl = s.find("\n")
+        if first_nl >= 0:
+            s = s[first_nl + 1 :]
+        if s.rstrip().endswith("```"):
+            s = s.rstrip()[:-3]
+    return s.strip()
+
+
+def _repair_json(s: str) -> str:
+    import re
+
+    s = re.sub(r",\s*([}\]])", r"\1", s)
+    return s
+
+
 def extract_json_object(raw: str) -> dict:
+    raw = _strip_fences(raw)
     start = raw.find("{")
     end = raw.rfind("}") + 1
-    if start >= 0 and end > start:
-        try:
-            result = json.loads(raw[start:end])
-            if isinstance(result, dict):
-                return result
-        except Exception:
-            pass
+    if start < 0 or end <= start:
+        return {}
+    candidate = raw[start:end]
+    try:
+        result = json.loads(candidate)
+        if isinstance(result, dict):
+            return result
+    except Exception:
+        pass
+    try:
+        result = json.loads(_repair_json(candidate))
+        if isinstance(result, dict):
+            return result
+    except Exception:
+        pass
     return {}
 
 

@@ -38,7 +38,8 @@ def hook_command(args: list[str]) -> str:
     command = entry_point_command(
         "mcp-memory-agent-hook", "mcp_memory_agent.hook_handler"
     )
-    return " ".join([command, *map(shlex.quote, args)])
+    full_command = [*hook_env_command_prefix(), command, *args]
+    return " ".join(map(shlex.quote, full_command))
 
 
 def has_cli() -> bool:
@@ -67,6 +68,13 @@ def mcp_env_args() -> list[str]:
         if value:
             args.extend(["--env", f"{key}={value}"])
     return args
+
+
+def hook_env_command_prefix() -> list[str]:
+    env = {key: os.environ[key] for key in ENV_KEYS if os.environ.get(key)}
+    if not env:
+        return []
+    return ["env", *[f"{key}={value}" for key, value in env.items()]]
 
 
 def register_mcp() -> None:

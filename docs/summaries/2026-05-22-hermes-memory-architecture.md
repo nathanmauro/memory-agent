@@ -78,9 +78,10 @@ Branches were stacked (each built on the previous), opened as stacked PRs, all m
 
 ## Current `master`
 
-Tip commit area: `696f0d7`
+Tip commit area: `5af7ab3`
 
 ```
+5af7ab3  Hermes memory architecture milestone summary (#12)
 696f0d7  Codex inject-context parity (#11)
 60cbb1f  memory_session_get (#10)
 a938aed  Weekly curator hook (#9)
@@ -89,7 +90,7 @@ a938aed  Weekly curator hook (#9)
 aa17781  Cold session archive + memory_session_search
 ```
 
-### MCP tools (11 total)
+### MCP tools (12 total)
 
 | Tool | Layer |
 |------|-------|
@@ -145,7 +146,7 @@ aa17781  Cold session archive + memory_session_search
 
 ```bash
 .venv/bin/python -m tests.test_validation
-# 23 passed, 0 failed (on master after v2)
+# 28 passed, 0 failed (after follow-up fixes)
 ```
 
 ---

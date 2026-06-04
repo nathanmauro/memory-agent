@@ -10,6 +10,46 @@
             "timeout": 1
           }
         ]
+      },
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "env LLM_BACKEND=lm-studio LM_STUDIO_URL=http://localhost:1234 LM_STUDIO_MODEL=qwen3-4b-instruct-2507-mlx LM_STUDIO_MAX_TOKENS=4096 /Users/nathan/Developer/proj/mcp-memory-agent/.venv/bin/mcp-memory-agent-hook finalize-session"
+          }
+        ]
+      }
+    ],
+    "SessionStart": [
+      {
+        "matcher": "startup|resume",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "env LLM_BACKEND=lm-studio LM_STUDIO_URL=http://localhost:1234 LM_STUDIO_MODEL=qwen3-4b-instruct-2507-mlx LM_STUDIO_MAX_TOKENS=4096 /Users/nathan/Developer/proj/mcp-memory-agent/.venv/bin/mcp-memory-agent-hook inject-context"
+          }
+        ]
+      },
+      {
+        "matcher": "startup|resume",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "env LLM_BACKEND=lm-studio LM_STUDIO_URL=http://localhost:1234 LM_STUDIO_MODEL=qwen3-4b-instruct-2507-mlx LM_STUDIO_MAX_TOKENS=4096 /Users/nathan/Developer/proj/mcp-memory-agent/.venv/bin/mcp-memory-agent-hook curator"
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "env LLM_BACKEND=lm-studio LM_STUDIO_URL=http://localhost:1234 LM_STUDIO_MODEL=qwen3-4b-instruct-2507-mlx LM_STUDIO_MAX_TOKENS=4096 /Users/nathan/Developer/proj/mcp-memory-agent/.venv/bin/mcp-memory-agent-hook record --kind tool_use"
+          }
+        ]
       }
     ]
   }
