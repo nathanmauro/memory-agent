@@ -214,36 +214,135 @@ def upsert_fts_memory(
         pass
 
 
-def resolve_memory_id(conn: sqlite3.Connection, id_or_prefix: str) -> str | None:
+def find_memory_matches(
+    conn: sqlite3.Connection, id_or_prefix: str, scope: str = ""
+) -> list[sqlite3.Row]:
     id_or_prefix = (id_or_prefix or "").strip()
     if not id_or_prefix:
-        return None
+        return []
     if len(id_or_prefix) >= 36:
-        row = conn.execute(
-            "SELECT id FROM memories WHERE id = ?", (id_or_prefix,)
-        ).fetchone()
-        return row["id"] if row else None
-    row = conn.execute(
-        "SELECT id FROM memories WHERE id LIKE ? LIMIT 1", (f"{id_or_prefix}%",)
-    ).fetchone()
-    return row["id"] if row else None
+        conditions = ["id = ?"]
+        params = [id_or_prefix]
+    else:
+        if len(id_or_prefix) < 8:
+            return []
+        conditions = ["id LIKE ?"]
+        params = [f"{id_or_prefix}%"]
+    if scope:
+        conditions.append("scope = ?")
+        params.append(scope)
+    return list(
+        conn.execute(
+            f"""
+            SELECT id, scope, updated_at
+            FROM memories
+            WHERE {' AND '.join(conditions)}
+            ORDER BY updated_at DESC
+            LIMIT 10
+            """,
+            params,
+        ).fetchall()
+    )
 
 
-def resolve_session_id(conn: sqlite3.Connection, id_or_prefix: str) -> str | None:
+def resolve_memory_id(
+    conn: sqlite3.Connection, id_or_prefix: str, scope: str = ""
+) -> str | None:
+    matches = find_memory_matches(conn, id_or_prefix, scope)
+    if len(matches) == 1:
+        return matches[0]["id"]
+    return None
+
+
+def touch_memories(conn: sqlite3.Connection, ids: list[str]) -> None:
+    clean_ids = []
+    seen = set()
+    for mem_id in ids:
+        if not isinstance(mem_id, str):
+            continue
+        mem_id = mem_id.strip()
+        if not mem_id or mem_id in seen:
+            continue
+        seen.add(mem_id)
+        clean_ids.append(mem_id)
+    if not clean_ids:
+        return
+
+    now = datetime.now(timezone.utc).isoformat()
+    try:
+        conn.executemany(
+            """
+            UPDATE memories
+            SET last_accessed_at = ?, access_count = access_count + 1
+            WHERE id = ?
+            """,
+            [(now, mem_id) for mem_id in clean_ids],
+        )
+    except Exception:
+        pass
+
+
+def find_session_matches(
+    conn: sqlite3.Connection, id_or_prefix: str, scope: str = ""
+) -> list[sqlite3.Row]:
     id_or_prefix = (id_or_prefix or "").strip()
     if not id_or_prefix:
-        return None
-    row = conn.execute(
-        "SELECT session_id FROM session_archive WHERE session_id = ?",
-        (id_or_prefix,),
-    ).fetchone()
-    if row:
-        return row["session_id"]
-    row = conn.execute(
-        "SELECT session_id FROM session_archive WHERE session_id LIKE ? LIMIT 1",
-        (f"{id_or_prefix}%",),
-    ).fetchone()
-    return row["session_id"] if row else None
+        return []
+
+    conditions = ["session_id = ?"]
+    params = [id_or_prefix]
+    if scope:
+        conditions.append("scope = ?")
+        params.append(scope)
+
+    try:
+        rows = list(
+            conn.execute(
+                f"""
+                SELECT session_id, scope, archived_at, archive_path
+                FROM session_archive
+                WHERE {' AND '.join(conditions)}
+                ORDER BY archived_at DESC
+                LIMIT 10
+                """,
+                params,
+            ).fetchall()
+        )
+        if rows:
+            return rows
+    except Exception:
+        return []
+
+    conditions = ["session_id LIKE ?"]
+    params = [f"{id_or_prefix}%"]
+    if scope:
+        conditions.append("scope = ?")
+        params.append(scope)
+
+    try:
+        return list(
+            conn.execute(
+                f"""
+                SELECT session_id, scope, archived_at, archive_path
+                FROM session_archive
+                WHERE {' AND '.join(conditions)}
+                ORDER BY archived_at DESC
+                LIMIT 10
+                """,
+                params,
+            ).fetchall()
+        )
+    except Exception:
+        return []
+
+
+def resolve_session_id(
+    conn: sqlite3.Connection, id_or_prefix: str, scope: str = ""
+) -> str | None:
+    matches = find_session_matches(conn, id_or_prefix, scope)
+    if len(matches) == 1:
+        return matches[0]["session_id"]
+    return None
 
 
 def format_archive_event(obj: dict) -> str:
@@ -547,7 +646,6 @@ def apply_lifecycle_transitions(conn: sqlite3.Connection, scope: str) -> int:
             WHERE scope = ?
               AND status = 'active'
               AND pinned = 0
-              AND importance < 4
               AND (
                     (last_accessed_at != '' AND last_accessed_at < ?)
                  OR (last_accessed_at = '' AND updated_at < ?)
@@ -660,4 +758,3 @@ def list_memory_scopes(conn: sqlite3.Connection) -> list[str]:
         return [str(row["scope"]) for row in rows if row["scope"]]
     except Exception:
         return []
-

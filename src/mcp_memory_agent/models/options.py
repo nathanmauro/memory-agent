@@ -11,6 +11,7 @@ class MemoryQueryOptions(BaseModel):
     query: StrippedText
     scope: StrippedText = ""
     category: StrippedText = ""
+    status: StrippedText = "active"
     limit: QueryLimit = 10
 
 
@@ -19,6 +20,7 @@ class MemoryListOptions(BaseModel):
 
     scope: StrippedText = ""
     category: StrippedText = ""
+    status: StrippedText = "active"
     limit: ListLimit = 20
 
 
@@ -28,6 +30,7 @@ class MemoryIndexOptions(BaseModel):
     query: StrippedText
     scope: StrippedText = ""
     category: StrippedText = ""
+    status: StrippedText = "active"
     limit: ListLimit = 20
 
 
@@ -41,6 +44,7 @@ class MemoryTimelineOptions(BaseModel):
     """Validated options for the memory_timeline tool."""
 
     scope: StrippedText = ""
+    status: StrippedText = "active"
     before_iso: StrippedText = ""
     after_iso: StrippedText = ""
     limit: ListLimit = 20

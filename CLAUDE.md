@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What This Is
 
-An MCP server that gives Claude Code persistent, structured memory. SQLite + an LLM (local Qwen via Ollama by default, or Claude Haiku via Amazon Bedrock) handle storage, categorization, dedup/merge, and relevance ranking. No vector databases or embeddings.
+An MCP server that gives coding agents persistent, structured memory. SQLite + a local or cloud LLM handle storage, categorization, dedup/merge, and relevance ranking. No vector databases or embeddings.
 
 The server is registered in `~/.mcp.json` and started automatically by Claude Code.
 
@@ -12,17 +12,17 @@ The server is registered in `~/.mcp.json` and started automatically by Claude Co
 
 ```bash
 # Run the server directly (debugging)
-python server.py
+.venv/bin/python -m mcp_memory_agent
 
 # Integration tests — exercise the live LLM. Default backend is Ollama (qwen2.5:14b);
 # set LLM_BACKEND=bedrock to use AWS instead.
-python test_integration.py
+.venv/bin/python tests/test_integration.py
 
 # Pure-local validation tests — patch llm.llm_call with a mock, no LLM required.
-python test_validation.py
+.venv/bin/python tests/test_validation.py
 
 # Run a single integration test: edit the `tests = [...]` list near the bottom
-# of test_integration.py to a single-element list, then re-run.
+# of tests/test_integration.py to a single-element list, then re-run.
 ```
 
 No build step, linter, formatter, or CI is configured. See `AGENTS.md` for code-style conventions (imports, naming, type annotations, defensive error handling).
@@ -33,16 +33,16 @@ The codebase is small and procedural; `models/` is the only package.
 
 | File / Dir                | Role                                                          |
 |---------------------------|---------------------------------------------------------------|
-| `server.py`               | Entry point: `db.init_db()` then `mcp.run()`.                 |
-| `tools.py`                | `FastMCP` app + 8 `@mcp.tool()` handlers, plus `_insert_memory` / `_gather_candidates` shared helpers. |
-| `db.py`                   | SQLite path/init, FTS upsert/delete, query-term extraction, `SESSIONS_DIR`, `resolve_memory_id`, `iter_session_buffers`. |
-| `llm.py`                  | LLM dispatch (Ollama / Bedrock), JSON extraction, ranking.    |
-| `hook_handler.py`         | Claude Code hook entrypoint: `inject-context`, `record`, `summarize-session`, `sweep`. Always exits 0. |
-| `hooks/*.sh`              | Thin shell wrappers wired into `~/.claude/settings.json` by `install.py`. |
-| `install.py`              | Idempotent installer: `claude mcp add -s user memory …` + merges hook entries into `~/.claude/settings.json` (with `.bak`). |
-| `models/`                 | Pydantic models + reusable `Annotated` validators.            |
-| `test_integration.py`     | Live-LLM tests, isolated to `memory_test.db` + `__test__` scope. |
-| `test_validation.py`      | Local tests; mocks `llm.llm_call`, uses tempdir DB + sessions dir. |
+| `src/mcp_memory_agent/server.py` | Entry point: `db.init_db()` then `mcp.run()`.       |
+| `src/mcp_memory_agent/tools.py` | `FastMCP` app + 14 `@mcp.tool()` handlers, plus `_insert_memory` / `_gather_candidates` shared helpers. |
+| `src/mcp_memory_agent/db.py` | SQLite path/init, FTS upsert/delete, query-term extraction, archive and lifecycle helpers. |
+| `src/mcp_memory_agent/llm.py` | LLM dispatch (Ollama / LM Studio / Bedrock), JSON extraction, ranking. |
+| `src/mcp_memory_agent/hook_handler.py` | Client hook entrypoint: `inject-context`, `record`, `summarize-session`, `finalize-session`, `sweep`, `curator`. Always exits 0. |
+| `src/mcp_memory_agent/integrations/` | Claude and Codex installer adapters.                |
+| `src/mcp_memory_agent/install.py` | Idempotent installer for Claude, Codex, or both.     |
+| `src/mcp_memory_agent/models/` | Pydantic models + reusable `Annotated` validators.    |
+| `tests/test_integration.py` | Live-LLM tests, isolated to `memory_test.db` + `__test__` scope. |
+| `tests/test_validation.py` | Local tests; mocks `llm.llm_call`, uses tempdir DB + sessions/archive dirs. |
 
 ### LLM backend
 
@@ -55,28 +55,32 @@ LLM responses are parsed with `extract_json_object` / `extract_json_array` (find
 
 ### Database
 
-SQLite at `~/.claude/memory/memory.db`, WAL mode. Two tables: `memories` (rows) and `memories_fts` (FTS5 virtual table over `content` + `tags`, kept in sync via `upsert_fts_memory` / `delete_fts_memory`). FTS is treated as optional — every FTS write/read is wrapped in `try/except sqlite3.OperationalError: pass` so the server still works on builds without FTS5.
+SQLite defaults to `~/.claude/memory/memory.db`, WAL mode, with `MEMORY_AGENT_HOME` available for client-neutral storage. Core tables are `memories` plus `memories_fts` for warm memory search and `session_archive` plus `session_archive_fts` for cold transcript search. FTS is treated as optional — every FTS write/read is wrapped in `try/except sqlite3.OperationalError: pass` so the server still works on builds without FTS5.
 
 Tests patch `db.DB_PATH` before calling `db.init_db()` to redirect to a test DB.
 
 ### Data flow
 
 - **`memory_store`** — load up to 30 most-recent memories in scope, ask LLM for `{category, tags, importance, merge_with_id?, merged_content?}`. If a merge is suggested, `UPDATE` the existing row; otherwise `INSERT` a new UUID. Both paths upsert into FTS. The body lives in `tools._insert_memory` so `hook_handler` shares it.
-- **`memory_query`** — `tools._gather_candidates` runs FTS5 MATCH first (terms extracted via `extract_search_terms`, stop words filtered, punctuation stripped to avoid MATCH syntax errors). If FTS returns < 5 rows, supplement with a LIKE fallback. Candidates are then re-ranked by the LLM (`rank_memories`) and truncated to `limit`.
-- **`memory_index`** — same `_gather_candidates` flow as `memory_query` but **no** LLM rerank. Returns one compact line per hit (id8, category, importance, tags, snippet). Use to scan many candidates cheaply.
-- **`memory_get`** — accepts a list of full UUIDs or 8-char prefixes (each resolved via `db.resolve_memory_id`). Returns full `MemoryRecord.format()` for each found id.
-- **`memory_list`** — pure DB query, no LLM.
-- **`memory_timeline`** — pure DB query ordered by `updated_at`. Bounded optionally by `before_iso` / `after_iso`. Switches to ASC ordering when `after_iso` is set.
+- **`memory_query`** — `tools._gather_candidates` runs FTS5 MATCH first (terms extracted via `extract_search_terms`, stop words filtered, punctuation stripped to avoid MATCH syntax errors). If FTS returns < 5 rows, supplement with a LIKE fallback. Candidates are then re-ranked by the LLM (`rank_memories`), truncated to `limit`, and marked accessed. Defaults to `status="active"`; pass `status="stale"`, `status="archived"`, or `status=""` when deliberately reviewing older records.
+- **`memory_index`** — same `_gather_candidates` flow as `memory_query` but **no** LLM rerank. Returns one compact line per hit (id8, category, importance, tags, snippet) and marks returned rows accessed. Use to scan many candidates cheaply. Defaults to active memories.
+- **`memory_get`** — accepts a list of full UUIDs or 8-char prefixes (each resolved via `db.resolve_memory_id`). Returns full `MemoryRecord.format()` for each found id and marks returned rows accessed.
+- **`memory_pin` / `memory_unpin`** — set or remove startup-injection privilege. Pinning also reactivates the memory and refreshes `updated_at`.
+- **`memory_list`** — pure DB query, no LLM. Defaults to active memories and accepts explicit `status`.
+- **`memory_timeline`** — pure DB query ordered by `updated_at`. Bounded optionally by `before_iso` / `after_iso`. Switches to ASC ordering when `after_iso` is set. Defaults to active memories.
 - **`memory_forget`** — accepts full UUID or first-8-char prefix; deletes from both tables.
-- **`memory_consolidate`** — load all memories in a scope, ask LLM for `{actions: [merge|delete|update], summary}`, apply each action best-effort (per-action `try/except` so one bad action can't abort the batch).
+- **`memory_session_search`** — searches archived session transcripts in cold storage.
+- **`memory_session_get`** — thaws a full archived transcript by ID or prefix; ambiguous prefixes require a longer ID or scope.
+- **`memory_hot_read` / `memory_hot_edit`** — read and safely edit bounded per-scope hot memory files.
+- **`memory_consolidate`** — load all memories in a scope, ask LLM for `{actions: [merge|delete|update], summary}`, and write a proposal by default. With `apply=True`, back up the scope and apply each action best-effort.
 
 ### Auto-capture flow (Claude Code hooks)
 
 `install.py` registers four entries in `~/.claude/settings.json`:
 
-- **`SessionStart` → `hook_handler.py inject-context`** — derives scope from `cwd` (basename of nearest `.git` toplevel, else basename of cwd, else `global`), reads top 3 by `(importance, updated_at) DESC` plus the next 5 most-recent unique IDs, prints them as a `hookSpecificOutput.additionalContext` bullet list. No LLM call. Also calls `_sweep()` before returning so SessionEnd misses don't strand buffers forever.
+- **`SessionStart` → `hook_handler.py inject-context`** — derives scope from `cwd` (basename of nearest `.git` toplevel, else basename of cwd, else `global`), injects bounded hot memory plus explicitly pinned active warm memories, and leaves broad warm memories or cold session pointers to pull-based tools. No LLM call.
 - **`UserPromptSubmit` / `PostToolUse` → `hook_handler.py record --kind …`** — append a JSON line to `~/.claude/memory/sessions/<session_id>.jsonl`. Each `data` field is truncated to 500 bytes. Dumb, fast, no LLM.
-- **`SessionEnd` → `hook_handler.py summarize-session`** — read the buffer, skip if `< 3` records, otherwise call LLM with the transcript, parse `{session_summary, memories[], open_actions[]}`, and insert each via `tools._insert_memory` (memories dedup/merge via LLM metadata; open actions stored as `open_action`). Archive and delete the buffer.
+- **`SessionEnd` → `hook_handler.py summarize-session`** — read the buffer, archive any non-empty session, skip warm-memory extraction if `< 3` records, otherwise call LLM with the transcript, parse `{session_summary, memories[], open_actions[]}`, and insert each via `tools._insert_memory` (memories dedup/merge via LLM metadata; open actions stored as `open_action`).
 
 Every hook script ends with `exit 0`, and the Python entry wraps `main()` in `try/except Exception: pass` — a memory-agent fault cannot break a Claude Code session.
 
