@@ -4,22 +4,28 @@ An [MCP](https://modelcontextprotocol.io) server that gives Claude Code (or any 
 
 ## What it does
 
-Exposes eight tools to the MCP client:
+Exposes fourteen tools to the MCP client:
 
 | Tool | Purpose |
 |---|---|
 | `memory_store` | Persist a memory; LLM picks category, tags, importance; merges with an existing memory when content overlaps. |
-| `memory_query` | FTS5 search over content + tags, supplemented by a LIKE fallback, then re-ranked by the LLM. |
-| `memory_index` | Same candidate gathering as `memory_query` but no LLM rerank — one compact line per hit, cheap to scan. |
+| `memory_query` | FTS5 search over content + tags, supplemented by a LIKE fallback, then re-ranked by the LLM. Defaults to active memories. |
+| `memory_index` | Same candidate gathering as `memory_query` but no LLM rerank — one compact line per hit, cheap to scan. Defaults to active memories. |
 | `memory_get` | Fetch full content for one or more IDs (full UUID or 8-char prefix). Use after `memory_index`. |
-| `memory_list` | Pure DB listing, filterable by scope + category. No LLM call. |
-| `memory_timeline` | DB-only chronological view, optionally bounded by `before_iso` / `after_iso`. |
+| `memory_pin` | Mark a memory as startup-safe so `inject-context` can include it. |
+| `memory_unpin` | Remove startup-injection privilege without deleting the memory. |
+| `memory_list` | Pure DB listing, filterable by scope, category, and status. No LLM call. Defaults to active memories. |
+| `memory_timeline` | DB-only chronological view, optionally bounded by `before_iso` / `after_iso`. Defaults to active memories. |
 | `memory_forget` | Delete a memory by full UUID or 8-char prefix. |
-| `memory_consolidate` | Ask the LLM to propose merge/delete/update actions over a scope's memories; applied best-effort. |
+| `memory_session_search` | Search archived session transcripts in cold storage. |
+| `memory_session_get` | Fetch the full archived transcript for one session. |
+| `memory_hot_read` | Read the bounded per-scope hot memory file. |
+| `memory_hot_edit` | Add, replace, or remove text in hot memory with size and duplicate guards. |
+| `memory_consolidate` | Ask the LLM to propose merge/delete/update actions over a scope's memories; dry-run by default. |
 
-Memories carry a `category` (`session_summary`, `code_decision`, `user_preference`, `project_knowledge`, `open_action`), a free-text `scope` (e.g. a project name or `global`), an `importance` (1–5), and tags.
+Memories carry a `category` (`session_summary`, `code_decision`, `user_preference`, `project_knowledge`, `open_action`), a free-text `scope` (e.g. a project name or `global`), lifecycle `status`, `pinned` startup-injection privilege, an `importance` (1–5), and tags.
 
-The database lives at `~/.claude/memory/memory.db` (WAL mode).
+The database defaults to `~/.claude/memory/memory.db` (WAL mode). Set `MEMORY_AGENT_HOME` to move client-neutral state elsewhere.
 
 ## LLM backends
 
@@ -73,59 +79,60 @@ One command registers the MCP server and writes hook entries:
 .venv/bin/python -m mcp_memory_agent.install --client both
 ```
 
-For Claude Code, hooks land in `~/.claude/settings.json` (backed up to `settings.json.bak`). For Codex, enable hooks in `~/.codex/config.toml` with `[features] codex_hooks = true`. Codex `SessionStart` runs the same `inject-context` output as Claude (hot + warm memories + cold session pointers) on `startup|resume`.
+For Claude Code, hooks land in `~/.claude/settings.json` (backed up to `settings.json.bak`). For Codex, enable hooks in `~/.codex/config.toml` with `[features] codex_hooks = true`. `SessionStart` `inject-context` is intentionally strict: it injects bounded hot memory plus explicitly pinned active warm memories only. Broad warm memories and cold session pointers stay pull-based through query/search tools.
 
-If you'd rather register the MCP server by hand, the wrapper script in `run_server.sh` honors `OLLAMA_MODEL` / `OLLAMA_URL` / `LLM_BACKEND` env vars before exec'ing `server.py`:
+If you'd rather register the MCP server by hand, point the client at the installed console script:
 
 ```bash
-claude mcp add -s user memory /absolute/path/to/run_server.sh
+claude mcp add -s user memory /absolute/path/to/.venv/bin/mcp-memory-agent-server
+codex mcp add memory -- /absolute/path/to/.venv/bin/mcp-memory-agent-server
 ```
 
-## Auto-capture (Claude Code hooks)
+## Auto-capture
 
-`install.py` wires four shell scripts in `hooks/` to Claude Code lifecycle events:
+`install.py` writes client hook entries that call `mcp-memory-agent-hook`:
 
-| Hook event         | Script                          | What it does |
-|--------------------|---------------------------------|--------------|
-| `SessionStart`     | `hooks/session_start.sh`        | Emits up to 8 past memories for the current scope as `additionalContext`. Also sweeps any orphaned session buffers older than 1 hour. No LLM call. |
-| `UserPromptSubmit` | `hooks/user_prompt_submit.sh`   | Appends the user prompt to a per-session JSONL buffer at `~/.claude/memory/sessions/<id>.jsonl`. |
-| `PostToolUse`      | `hooks/post_tool_use.sh`        | Appends the tool name + truncated input/output to the same buffer. |
-| `SessionEnd`       | `hooks/session_end.sh`          | LLM-summarizes the buffer into one `session_summary`, up to three sub-memories, and up to three `open_action` items, then deletes the buffer. |
+| Hook event | What it does |
+|---|---|
+| `SessionStart` | Injects bounded hot memory and explicitly pinned active warm memories. Broad warm memories and cold session pointers are retrieved on demand. |
+| `UserPromptSubmit` | Claude only: appends the user prompt to a per-session JSONL buffer. |
+| `PostToolUse` | Appends tool details to the same buffer. |
+| `SessionEnd` / `Stop` | Archives any non-empty buffer, summarizes sessions with at least 3 records into warm memories, and stores extracted `open_action` rows. |
 
 Scope is derived from the session's `cwd`: basename of the nearest `.git` toplevel, else basename of `cwd`, else `global`. Every hook is wrapped to exit 0 on failure — a memory-agent fault cannot break a Claude Code session.
 
 ## Run directly (debugging)
 
 ```bash
-.venv/bin/python server.py
+.venv/bin/python -m mcp_memory_agent
 ```
 
 ## Tests
 
 ```bash
 # Pure-local validation, mocks the LLM, no network needed
-.venv/bin/python test_validation.py
+.venv/bin/python tests/test_validation.py
 
 # Live integration tests; defaults to Ollama, set LLM_BACKEND=bedrock to switch
-LLM_BACKEND=ollama OLLAMA_MODEL=gemma4:26b .venv/bin/python test_integration.py
+LLM_BACKEND=ollama OLLAMA_MODEL=gemma4:26b .venv/bin/python tests/test_integration.py
 ```
 
 ## Architecture
 
-Small and procedural; `models/` is the only package.
+Small and procedural; `models/` is the only subpackage.
 
 | File / Dir            | Role                                                          |
 |-----------------------|---------------------------------------------------------------|
-| `server.py`           | Entry point: `db.init_db()` then `mcp.run()`.                 |
-| `tools.py`            | `FastMCP` app and the eight `@mcp.tool()` handlers.           |
-| `db.py`               | SQLite path/init, FTS upsert/delete, query-term extraction, session-buffer iteration. |
-| `llm.py`              | LLM dispatch (Ollama / Bedrock), JSON extraction, ranking.    |
-| `hook_handler.py`     | CLI entry for Claude Code hooks: `inject-context`, `record`, `summarize-session`, `sweep`. |
-| `hooks/*.sh`          | Thin shell wrappers pointed at `hook_handler.py` from `~/.claude/settings.json`. |
-| `install.py`          | One-shot: registers the MCP server and merges hook entries into `~/.claude/settings.json`. |
-| `models/`             | Pydantic models and reusable `Annotated` validators.          |
-| `test_integration.py` | Live-LLM tests, isolated to `memory_test.db` + `__test__` scope. |
-| `test_validation.py`  | Local tests; mocks `llm.llm_call`, uses a tempdir DB + sessions dir. |
+| `src/mcp_memory_agent/server.py` | Entry point: `db.init_db()` then `mcp.run()`.       |
+| `src/mcp_memory_agent/tools.py` | `FastMCP` app and the fourteen `@mcp.tool()` handlers. |
+| `src/mcp_memory_agent/db.py` | SQLite path/init, FTS upsert/delete, query-term extraction, session-buffer and archive helpers. |
+| `src/mcp_memory_agent/llm.py` | LLM dispatch (Ollama / LM Studio / Bedrock), JSON extraction, ranking. |
+| `src/mcp_memory_agent/hook_handler.py` | CLI entry for hooks: `inject-context`, `record`, `summarize-session`, `finalize-session`, `sweep`, `curator`. |
+| `src/mcp_memory_agent/integrations/` | Claude and Codex installer adapters. |
+| `src/mcp_memory_agent/install.py` | One-shot client installer for Claude, Codex, or both. |
+| `src/mcp_memory_agent/models/` | Pydantic models and reusable `Annotated` validators. |
+| `tests/test_integration.py` | Live-LLM tests, isolated to `memory_test.db` + `__test__` scope. |
+| `tests/test_validation.py` | Local tests; mocks `llm.llm_call`, uses a tempdir DB + sessions/archive dirs. |
 
 See `CLAUDE.md` for deeper architecture notes and `AGENTS.md` for code-style conventions.
 

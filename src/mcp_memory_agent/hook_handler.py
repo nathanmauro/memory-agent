@@ -15,6 +15,7 @@ fault never breaks a Claude Code session.
 
 import argparse
 import json
+import logging
 import os
 import sys
 from datetime import datetime, timezone
@@ -22,11 +23,27 @@ from datetime import datetime, timezone
 from . import db, hot, llm, tools
 from .models import MemoryRecord
 
+_log_path = os.path.join(
+    os.environ.get("MEMORY_AGENT_HOME", os.path.expanduser("~/.claude/memory")),
+    "summarize.log",
+)
+log = logging.getLogger("summarize")
+log.setLevel(logging.DEBUG)
+log.propagate = False
+if not log.handlers:
+    try:
+        os.makedirs(os.path.dirname(_log_path), exist_ok=True)
+        handler = logging.FileHandler(_log_path)
+        handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
+        log.addHandler(handler)
+    except Exception:
+        log.addHandler(logging.NullHandler())
+
 MAX_EVENT_BYTES = 500
 SESSION_STALE_SECONDS = 3600
 MAX_EXTRACTED_ITEMS = 3
 INJECT_BUDGET_CHARS = hot.HOT_MAX_CHARS
-WARM_BUDGET_RATIO = 0.7
+PINNED_WARM_RESERVED_CHARS = 2000
 
 
 def _read_hook_input() -> dict:
@@ -173,20 +190,33 @@ def _remove_buffer(path: str) -> None:
         pass
 
 
-def _build_transcript(events: list[dict]) -> str:
-    lines = []
+TRANSCRIPT_MAX_CHARS = 6000
+
+
+def _build_transcript(
+    events: list[dict], max_chars: int = TRANSCRIPT_MAX_CHARS
+) -> str:
+    lines: list[str] = []
+    used = 0
     for e in events[:200]:
         kind = e.get("kind", "")
         data = e.get("data", {}) if isinstance(e.get("data"), dict) else {}
         if kind == "prompt":
-            lines.append(f"USER: {str(data.get('prompt', ''))[:400]}")
+            line = f"USER: {str(data.get('prompt', ''))[:400]}"
         elif kind == "tool_use":
             tname = data.get("tool_name", "?")
             try:
                 tinput = json.dumps(data.get("tool_input", {}))[:300]
             except Exception:
                 tinput = ""
-            lines.append(f"TOOL {tname}: {tinput}")
+            line = f"TOOL {tname}: {tinput}"
+        else:
+            continue
+        cost = len(line) + 1
+        if used + cost > max_chars:
+            break
+        lines.append(line)
+        used += cost
     return "\n".join(lines)
 
 
@@ -221,31 +251,39 @@ def _parse_memory_item(item: object) -> tuple[str, str]:
 def _llm_summarize(events: list[dict], scope: str) -> dict:
     transcript = _build_transcript(events)
     if not transcript:
+        log.debug("empty transcript for scope=%s, skipping LLM call", scope)
         return {}
 
     system = (
         "You are a memory extractor. Given a Claude Code session transcript, "
         "produce a JSON object describing what should be remembered for future sessions.\n\n"
-        "Respond with ONLY valid JSON:\n"
+        "Respond with ONLY valid JSON (no markdown fences):\n"
         "{\n"
-        '  "session_summary": "1-3 sentences capturing what was accomplished — concrete enough to be useful next time the user opens this project. Empty string if nothing meaningful.",\n'
-        '  "memories": ["Specific code_decision, user_preference, or project_knowledge fact worth a separate memory. 0-3 items. Each item may be a string or {\"content\": \"...\", \"tags\": \"comma,tags\"}."],\n'
-        '  "open_actions": ["Short actionable todo not yet completed. 0-3 items. Empty array if none remain."]\n'
-        "}"
+        '  "session_summary": "1-3 sentences capturing what was accomplished.",\n'
+        '  "memories": ["Plain string fact worth remembering. 0-3 items."],\n'
+        '  "open_actions": ["Short actionable todo not yet completed. 0-3 items."]\n'
+        "}\n\n"
+        "Every array element must be a plain string. Do not nest objects inside arrays."
     )
     user = f"Project scope: {scope}\n\nTranscript ({len(events)} events):\n{transcript}"
 
     try:
         raw = llm.llm_call(system, user)
-    except Exception:
+    except Exception as exc:
+        log.warning("LLM call failed for scope=%s: %s", scope, exc)
         return {}
     parsed = llm.extract_json_object(raw)
+    if not parsed:
+        log.warning(
+            "JSON parse failed for scope=%s, raw=%s", scope, repr(raw[:500])
+        )
     return parsed if isinstance(parsed, dict) else {}
 
 
 def _summarize_buffer(path: str, fallback_scope: str = "global") -> None:
     events = _read_buffer(path)
-    if len(events) < 3:
+    if not events:
+        log.debug("empty buffer %s, removing", path)
         _remove_buffer(path)
         return
 
@@ -254,7 +292,13 @@ def _summarize_buffer(path: str, fallback_scope: str = "global") -> None:
     session_id = os.path.basename(path).replace(".jsonl", "")
     source = session_id
 
+    log.info(
+        "summarize scope=%s session=%s events=%d", scope, session_id, len(events)
+    )
     db.archive_session_buffer(path, scope, session_id)
+    if len(events) < 3:
+        log.debug("< 3 events, archive only (no warm memory)")
+        return
 
     parsed = _llm_summarize(events, scope)
     summary = parsed.get("session_summary", "") if parsed else ""
@@ -274,8 +318,8 @@ def _summarize_buffer(path: str, fallback_scope: str = "global") -> None:
             try:
                 tools._insert_memory(conn, summary.strip(), scope, source)
                 inserted = True
-            except Exception:
-                pass
+            except Exception as exc:
+                log.warning("insert summary failed: %s", exc)
         for item in sub[:MAX_EXTRACTED_ITEMS]:
             content, tags = _parse_memory_item(item)
             if not content:
@@ -285,7 +329,8 @@ def _summarize_buffer(path: str, fallback_scope: str = "global") -> None:
                     conn, content, scope, source, tags=tags
                 )
                 inserted = True
-            except Exception:
+            except Exception as exc:
+                log.warning("insert memory failed: %s", exc)
                 continue
         for action in _parse_string_list(open_actions):
             try:
@@ -293,10 +338,14 @@ def _summarize_buffer(path: str, fallback_scope: str = "global") -> None:
                     conn, action, scope, source, category="open_action"
                 )
                 inserted = True
-            except Exception:
+            except Exception as exc:
+                log.warning("insert open_action failed: %s", exc)
                 continue
         if inserted:
             conn.commit()
+            log.info("committed memories for scope=%s session=%s", scope, session_id)
+        else:
+            log.warning("no memories inserted for scope=%s session=%s", scope, session_id)
     finally:
         conn.close()
 
@@ -324,82 +373,55 @@ def _session_summary_for_source(
 def _inject_context(payload: dict) -> None:
     scope = _derive_scope(_payload_cwd(payload))
 
-    _sweep()
-
     body_parts: list[str] = []
     used = 0
+    pinned_rows = []
+
+    conn = db.get_db()
+    try:
+        pinned_rows = conn.execute(
+            """
+            SELECT * FROM memories
+            WHERE scope = ? AND status = 'active'
+              AND pinned = 1
+            ORDER BY importance DESC, updated_at DESC
+            """,
+            (scope,),
+        ).fetchall()
+    finally:
+        conn.close()
 
     hot_text = hot.read_hot(scope).strip()
     if hot_text:
         hot_header = f"Hot memory (scope '{scope}'):\n"
         hot_block = hot_header + hot_text
-        if len(hot_block) > INJECT_BUDGET_CHARS:
-            hot_block = hot_block[:INJECT_BUDGET_CHARS]
+        hot_budget = INJECT_BUDGET_CHARS
+        if pinned_rows:
+            hot_budget = max(0, INJECT_BUDGET_CHARS - PINNED_WARM_RESERVED_CHARS)
+        if len(hot_block) > hot_budget:
+            hot_block = hot_block[:hot_budget]
         body_parts.append(hot_block.rstrip())
         used = len(hot_block)
 
     bullets: list[str] = []
-    pointer_lines: list[str] = []
 
-    conn = db.get_db()
-    try:
-        remaining = max(0, INJECT_BUDGET_CHARS - used)
-        warm_budget = int(remaining * WARM_BUDGET_RATIO) if remaining > 0 else 0
-        if warm_budget > 0:
-            header = f"Past memories for scope '{scope}':\n"
-            warm_used = len(header)
-            if used + warm_used <= INJECT_BUDGET_CHARS:
-                rows = conn.execute(
-                    """
-                    SELECT * FROM memories
-                    WHERE scope = ? AND status = 'active'
-                    ORDER BY importance DESC, updated_at DESC
-                    """,
-                    (scope,),
-                ).fetchall()
-                for row in rows:
-                    m = MemoryRecord.from_row(row)
-                    snippet = m.content.replace("\n", " ")[:200]
-                    line = f"- [{m.id[:8]}] ({m.category}) {snippet}"
-                    line_len = len(line) + 1
-                    if warm_used + line_len > warm_budget:
-                        break
-                    bullets.append(line)
-                    warm_used += line_len
-                if bullets:
-                    body_parts.append(header + "\n".join(bullets))
-                    used += warm_used
-
-        remaining = INJECT_BUDGET_CHARS - used
-        if remaining > 120:
-            archives = db.list_recent_archived_sessions(conn, scope, limit=8)
-            if archives:
-                pointer_header = "\nArchived sessions (use memory_session_search to thaw):\n"
-                if used + len(pointer_header) <= INJECT_BUDGET_CHARS:
-                    pointer_used = len(pointer_header)
-                    for row in archives:
-                        session_id = row["session_id"]
-                        archived_at = str(row["archived_at"])[:10]
-                        summary = _session_summary_for_source(conn, scope, session_id)
-                        if summary:
-                            line = (
-                                f"- [{session_id[:8]}] {archived_at} — {summary}"
-                            )
-                        else:
-                            line = (
-                                f"- [{session_id[:8]}] {archived_at} — "
-                                "archived transcript"
-                            )
-                        line_len = len(line) + 1
-                        if pointer_used + line_len > remaining:
-                            break
-                        pointer_lines.append(line)
-                        pointer_used += line_len
-                    if pointer_lines:
-                        pointer_lines.insert(0, pointer_header.rstrip())
-                        body_parts.append("\n".join(pointer_lines))
-    finally:
-        conn.close()
+    remaining = max(0, INJECT_BUDGET_CHARS - used)
+    if remaining > 0 and pinned_rows:
+        header = f"Pinned memories for scope '{scope}':\n"
+        warm_used = len(header)
+        if used + warm_used <= INJECT_BUDGET_CHARS:
+            for row in pinned_rows:
+                m = MemoryRecord.from_row(row)
+                snippet = m.content.replace("\n", " ")[:200]
+                line = f"- [{m.id[:8]}] ({m.category}) {snippet}"
+                line_len = len(line) + 1
+                if warm_used + line_len > remaining:
+                    break
+                bullets.append(line)
+                warm_used += line_len
+            if bullets:
+                body_parts.append(header + "\n".join(bullets))
+                used += warm_used
 
     if not body_parts:
         print(json.dumps({}))
@@ -416,8 +438,10 @@ def _inject_context(payload: dict) -> None:
 
 
 def _summarize_session(payload: dict) -> None:
-    path = _session_path(_payload_session_id(payload))
+    session_id = _payload_session_id(payload)
+    path = _session_path(session_id)
     if not path or not os.path.exists(path):
+        log.debug("no buffer for session_id=%s path=%s", session_id, path)
         return
     fallback = _derive_scope(_payload_cwd(payload))
     _summarize_buffer(path, fallback_scope=fallback)
@@ -504,6 +528,6 @@ def main() -> None:
 if __name__ == "__main__":
     try:
         main()
-    except Exception:
-        pass
+    except Exception as exc:
+        log.error("hook_handler fatal: %s", exc, exc_info=True)
     sys.exit(0)

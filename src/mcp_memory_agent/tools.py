@@ -14,8 +14,8 @@ from .models import (
     MemoryListOptions,
     MemoryQueryOptions,
     MemoryRecord,
-    MemorySessionSearchOptions,
     MemorySessionGetOptions,
+    MemorySessionSearchOptions,
     MemoryTimelineOptions,
 )
 from .models.types import _normalize_category, _normalize_tags
@@ -73,9 +73,18 @@ def _insert_memory(
     if tags.strip():
         meta.tags = _normalize_tags(tags)
 
+    existing_ids = {m.id for m in existing}
+    if meta.merge_with_id not in existing_ids:
+        meta.merge_with_id = None
+        meta.merged_content = None
+
     if meta.merge_with_id and meta.merged_content:
-        conn.execute(
-            "UPDATE memories SET content = ?, category = ?, tags = ?, importance = ?, updated_at = ? WHERE id = ?",
+        cursor = conn.execute(
+            """
+            UPDATE memories
+            SET content = ?, category = ?, tags = ?, importance = ?, updated_at = ?
+            WHERE id = ? AND scope = ?
+            """,
             (
                 meta.merged_content,
                 meta.category,
@@ -83,10 +92,14 @@ def _insert_memory(
                 meta.importance,
                 now,
                 meta.merge_with_id,
+                scope,
             ),
         )
-        db.upsert_fts_memory(conn, meta.merge_with_id, meta.merged_content, meta.tags)
-        return f"Merged with existing memory {meta.merge_with_id}"
+        if cursor.rowcount:
+            db.upsert_fts_memory(
+                conn, meta.merge_with_id, meta.merged_content, meta.tags
+            )
+            return f"Merged with existing memory {meta.merge_with_id}"
 
     mem_id = str(uuid.uuid4())
     conn.execute(
@@ -108,10 +121,14 @@ def _insert_memory(
 
 
 def _gather_candidates(
-    conn: sqlite3.Connection, query: str, scope: str = "", category: str = ""
+    conn: sqlite3.Connection,
+    query: str,
+    scope: str = "",
+    category: str = "",
+    status: str = "active",
 ) -> list[MemoryRecord]:
     """FTS5 search over content+tags with a LIKE fallback when FTS returns too few rows."""
-    conditions, params = db.build_memory_filters(scope, category, alias="m")
+    conditions, params = db.build_memory_filters(scope, category, alias="m", status=status)
 
     candidates: list[MemoryRecord] = []
     try:
@@ -158,6 +175,17 @@ def _gather_candidates(
     return candidates
 
 
+def _touch_memory_ids(ids: list[str]) -> None:
+    if not ids:
+        return
+    conn = db.get_db()
+    try:
+        db.touch_memories(conn, ids)
+        conn.commit()
+    finally:
+        conn.close()
+
+
 @mcp.tool()
 def memory_store(content: str, scope: str = "global", source: str = "") -> str:
     """Store a memory. The LLM will categorize it, check for duplicates, and merge if needed.
@@ -176,7 +204,11 @@ def memory_store(content: str, scope: str = "global", source: str = "") -> str:
 
 @mcp.tool()
 def memory_query(
-    query: str, scope: str = "", category: str = "", limit: int = 10
+    query: str,
+    scope: str = "",
+    category: str = "",
+    status: str = "active",
+    limit: int = 10,
 ) -> str:
     """Retrieve relevant memories using natural language search.
 
@@ -184,18 +216,19 @@ def memory_query(
         query: What to search for (natural language)
         scope: Filter by scope (project name or 'global'). Empty = search all scopes.
         category: Filter by category (session_summary, code_decision, user_preference, project_knowledge). Empty = all.
+        status: Filter by lifecycle status (active, stale, archived). Empty = all.
         limit: Maximum number of results to return (default 10)
     """
     try:
         options = MemoryQueryOptions(
-            query=query, scope=scope, category=category, limit=limit
+            query=query, scope=scope, category=category, status=status, limit=limit
         )
     except Exception:
         options = MemoryQueryOptions(query=str(query))
 
     conn = db.get_db()
     candidates = _gather_candidates(
-        conn, options.query, options.scope, options.category
+        conn, options.query, options.scope, options.category, options.status
     )
     conn.close()
 
@@ -203,13 +236,18 @@ def memory_query(
         return "No memories found."
 
     ranked = llm.rank_memories(options.query, candidates, options.limit)
+    _touch_memory_ids([m.id for m in ranked])
     results = [m.format() for m in ranked]
     return f"Found {len(ranked)} memories:\n\n" + "\n\n".join(results)
 
 
 @mcp.tool()
 def memory_index(
-    query: str, scope: str = "", category: str = "", limit: int = 20
+    query: str,
+    scope: str = "",
+    category: str = "",
+    status: str = "active",
+    limit: int = 20,
 ) -> str:
     """Token-efficient search: FTS5+LIKE candidates with no LLM rerank. Returns one line per hit.
 
@@ -219,18 +257,19 @@ def memory_index(
         query: What to search for (natural language)
         scope: Filter by scope. Empty = search all scopes.
         category: Filter by category. Empty = all categories.
+        status: Filter by lifecycle status (active, stale, archived). Empty = all.
         limit: Maximum results (default 20)
     """
     try:
         options = MemoryIndexOptions(
-            query=query, scope=scope, category=category, limit=limit
+            query=query, scope=scope, category=category, status=status, limit=limit
         )
     except Exception:
         options = MemoryIndexOptions(query=str(query))
 
     conn = db.get_db()
     candidates = _gather_candidates(
-        conn, options.query, options.scope, options.category
+        conn, options.query, options.scope, options.category, options.status
     )
     conn.close()
 
@@ -238,6 +277,7 @@ def memory_index(
         return "No memories found."
 
     hits = candidates[: options.limit]
+    _touch_memory_ids([m.id for m in hits])
     lines = []
     for m in hits:
         snippet = m.content[:160].replace("\n", " ")
@@ -278,6 +318,9 @@ def memory_get(ids: list[str]) -> str:
         if row:
             found.append(MemoryRecord.from_row(row))
             seen.add(resolved)
+    if found:
+        db.touch_memories(conn, [m.id for m in found])
+        conn.commit()
     conn.close()
 
     if not found:
@@ -289,9 +332,76 @@ def memory_get(ids: list[str]) -> str:
     return out
 
 
+def _set_memory_pin(id: str, scope: str, pinned: int) -> str:
+    conn = db.get_db()
+    matches = db.find_memory_matches(conn, id, scope)
+    if len(matches) > 1:
+        lines = [
+            f"- {row['id'][:8]} [{row['scope']}] {str(row['updated_at'])[:10]}"
+            for row in matches
+        ]
+        conn.close()
+        return (
+            f"Memory ID prefix '{id}' is ambiguous; pass a longer ID or scope.\n"
+            + "\n".join(lines)
+        )
+    resolved = matches[0]["id"] if matches else None
+    if not resolved:
+        conn.close()
+        return f"No memory found matching '{id}'"
+
+    now = datetime.now(timezone.utc).isoformat()
+    if pinned:
+        conn.execute(
+            """
+            UPDATE memories
+            SET pinned = 1, status = 'active', updated_at = ?
+            WHERE id = ?
+            """,
+            (now, resolved),
+        )
+        action = "Pinned"
+    else:
+        conn.execute(
+            """
+            UPDATE memories
+            SET pinned = 0, updated_at = ?
+            WHERE id = ?
+            """,
+            (now, resolved),
+        )
+        action = "Unpinned"
+    conn.commit()
+    conn.close()
+    return f"{action} memory {resolved}"
+
+
+@mcp.tool()
+def memory_pin(id: str, scope: str = "") -> str:
+    """Mark a memory as startup-safe so inject-context can include it.
+
+    Args:
+        id: Memory UUID (full or first 8 characters)
+        scope: Optional scope filter when resolving ambiguous prefixes
+    """
+    return _set_memory_pin(id, scope, 1)
+
+
+@mcp.tool()
+def memory_unpin(id: str, scope: str = "") -> str:
+    """Remove startup-injection privilege from a memory without deleting it.
+
+    Args:
+        id: Memory UUID (full or first 8 characters)
+        scope: Optional scope filter when resolving ambiguous prefixes
+    """
+    return _set_memory_pin(id, scope, 0)
+
+
 @mcp.tool()
 def memory_timeline(
     scope: str = "",
+    status: str = "active",
     before_iso: str = "",
     after_iso: str = "",
     limit: int = 20,
@@ -300,18 +410,23 @@ def memory_timeline(
 
     Args:
         scope: Filter by scope. Empty = all scopes.
+        status: Filter by lifecycle status (active, stale, archived). Empty = all.
         before_iso: Only memories with updated_at < this ISO timestamp. Empty = no upper bound.
         after_iso: Only memories with updated_at > this ISO timestamp. Empty = no lower bound.
         limit: Maximum results (default 20)
     """
     try:
         options = MemoryTimelineOptions(
-            scope=scope, before_iso=before_iso, after_iso=after_iso, limit=limit
+            scope=scope,
+            status=status,
+            before_iso=before_iso,
+            after_iso=after_iso,
+            limit=limit,
         )
     except Exception:
         options = MemoryTimelineOptions()
 
-    conditions, params = db.build_memory_filters(options.scope, "")
+    conditions, params = db.build_memory_filters(options.scope, "", status=options.status)
     if options.before_iso:
         conditions.append("updated_at < ?")
         params.append(options.before_iso)
@@ -337,21 +452,28 @@ def memory_timeline(
 
 
 @mcp.tool()
-def memory_list(scope: str = "", category: str = "", limit: int = 20) -> str:
+def memory_list(
+    scope: str = "", category: str = "", status: str = "active", limit: int = 20
+) -> str:
     """List recent memories. No LLM call — just a database query.
 
     Args:
         scope: Filter by scope. Empty = all scopes.
         category: Filter by category. Empty = all categories.
+        status: Filter by lifecycle status (active, stale, archived). Empty = all.
         limit: Maximum results (default 20)
     """
     try:
-        options = MemoryListOptions(scope=scope, category=category, limit=limit)
+        options = MemoryListOptions(
+            scope=scope, category=category, status=status, limit=limit
+        )
     except Exception:
         options = MemoryListOptions()
 
     conn = db.get_db()
-    conditions, params = db.build_memory_filters(options.scope, options.category)
+    conditions, params = db.build_memory_filters(
+        options.scope, options.category, status=options.status
+    )
     where = "WHERE " + " AND ".join(conditions) if conditions else ""
     params.append(options.limit)
 
@@ -369,14 +491,26 @@ def memory_list(scope: str = "", category: str = "", limit: int = 20) -> str:
 
 
 @mcp.tool()
-def memory_forget(id: str) -> str:
+def memory_forget(id: str, scope: str = "") -> str:
     """Delete a specific memory by ID (or first 8 chars of ID).
 
     Args:
         id: Memory UUID (full or first 8 characters)
+        scope: Optional scope filter when resolving ambiguous prefixes
     """
     conn = db.get_db()
-    resolved = db.resolve_memory_id(conn, id)
+    matches = db.find_memory_matches(conn, id, scope)
+    if len(matches) > 1:
+        lines = [
+            f"- {row['id'][:8]} [{row['scope']}] {str(row['updated_at'])[:10]}"
+            for row in matches
+        ]
+        conn.close()
+        return (
+            f"Memory ID prefix '{id}' is ambiguous; pass a longer ID or scope.\n"
+            + "\n".join(lines)
+        )
+    resolved = matches[0]["id"] if matches else None
     if not resolved:
         conn.close()
         return f"No memory found matching '{id}'"
@@ -433,7 +567,19 @@ def memory_session_get(session_id: str, scope: str = "") -> str:
         options = MemorySessionGetOptions(session_id=str(session_id))
 
     conn = db.get_db()
-    resolved = db.resolve_session_id(conn, options.session_id)
+    matches = db.find_session_matches(conn, options.session_id, options.scope)
+    if len(matches) > 1:
+        lines = [
+            f"- {row['session_id'][:8]} [{row['scope']}] {str(row['archived_at'])[:10]}"
+            for row in matches
+        ]
+        conn.close()
+        return (
+            f"Archived session prefix '{options.session_id}' is ambiguous; "
+            "pass a longer ID or scope.\n"
+            + "\n".join(lines)
+        )
+    resolved = matches[0]["session_id"] if matches else None
     if not resolved:
         conn.close()
         return f"No archived session found matching '{options.session_id}'."
@@ -473,7 +619,7 @@ def memory_session_get(session_id: str, scope: str = "") -> str:
 
 
 def _apply_consolidation_actions(
-    conn: sqlite3.Connection, result: ConsolidationResult
+    conn: sqlite3.Connection, result: ConsolidationResult, allowed_ids: set[str]
 ) -> int:
     now = datetime.now(timezone.utc).isoformat()
     applied = 0
@@ -485,26 +631,40 @@ def _apply_consolidation_actions(
                 and action.keep_id
                 and action.delete_id
                 and action.new_content
+                and action.keep_id in allowed_ids
+                and action.delete_id in allowed_ids
             ):
-                conn.execute(
+                update_cursor = conn.execute(
                     "UPDATE memories SET content = ?, updated_at = ? WHERE id = ?",
                     (action.new_content, now, action.keep_id),
                 )
-                conn.execute("DELETE FROM memories WHERE id = ?", (action.delete_id,))
-                db.delete_fts_memory(conn, action.delete_id)
-                db.upsert_fts_memory(conn, action.keep_id, action.new_content, "")
-                applied += 1
-            elif action.type == "delete" and action.id:
-                conn.execute("DELETE FROM memories WHERE id = ?", (action.id,))
-                db.delete_fts_memory(conn, action.id)
-                applied += 1
-            elif action.type == "update" and action.id and action.new_content:
-                conn.execute(
+                delete_cursor = conn.execute(
+                    "DELETE FROM memories WHERE id = ?", (action.delete_id,)
+                )
+                if update_cursor.rowcount and delete_cursor.rowcount:
+                    db.delete_fts_memory(conn, action.delete_id)
+                    db.upsert_fts_memory(conn, action.keep_id, action.new_content, "")
+                    allowed_ids.discard(action.delete_id)
+                    applied += 1
+            elif action.type == "delete" and action.id and action.id in allowed_ids:
+                cursor = conn.execute("DELETE FROM memories WHERE id = ?", (action.id,))
+                if cursor.rowcount:
+                    db.delete_fts_memory(conn, action.id)
+                    allowed_ids.discard(action.id)
+                    applied += 1
+            elif (
+                action.type == "update"
+                and action.id
+                and action.new_content
+                and action.id in allowed_ids
+            ):
+                cursor = conn.execute(
                     "UPDATE memories SET content = ?, updated_at = ? WHERE id = ?",
                     (action.new_content, now, action.id),
                 )
-                db.upsert_fts_memory(conn, action.id, action.new_content, "")
-                applied += 1
+                if cursor.rowcount:
+                    db.upsert_fts_memory(conn, action.id, action.new_content, "")
+                    applied += 1
         except Exception:
             continue
     return applied
@@ -627,7 +787,7 @@ If nothing needs consolidation, return {"actions": [], "summary": "all memories 
     backup_path = db.write_backup_snapshot(scope)
     conn = db.get_db()
     lifecycle_changed = db.apply_lifecycle_transitions(conn, scope)
-    applied = _apply_consolidation_actions(conn, result)
+    applied = _apply_consolidation_actions(conn, result, {m.id for m in memories})
     conn.commit()
     conn.close()
 
