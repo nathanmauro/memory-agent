@@ -10,6 +10,7 @@ import tempfile
 from datetime import datetime, timedelta, timezone
 
 from mcp_memory_agent import db, hook_handler, hot, llm, tools
+from mcp_memory_agent.models import MemoryRecord
 
 PASS = 0
 FAIL = 0
@@ -31,6 +32,11 @@ ORIGINAL_PROPOSALS_DIR = db.PROPOSALS_DIR
 ORIGINAL_BACKUPS_DIR = db.BACKUPS_DIR
 ORIGINAL_CURATOR_LAST_RUN_PATH = db.CURATOR_LAST_RUN_PATH
 ORIGINAL_LLM_CALL = llm.llm_call
+ORIGINAL_LLM_BACKEND = llm.LLM_BACKEND
+ORIGINAL_OLLAMA_CALL = llm._ollama_call
+ORIGINAL_LM_STUDIO_CALL = llm._lm_studio_call
+ORIGINAL_BEDROCK_CALL = llm._bedrock_call
+ORIGINAL_CODEX_CALL = llm._codex_call
 
 
 def ok(name: str) -> None:
@@ -69,6 +75,11 @@ def restore_state() -> None:
     db.BACKUPS_DIR = ORIGINAL_BACKUPS_DIR
     db.CURATOR_LAST_RUN_PATH = ORIGINAL_CURATOR_LAST_RUN_PATH
     llm.llm_call = ORIGINAL_LLM_CALL
+    llm.LLM_BACKEND = ORIGINAL_LLM_BACKEND
+    llm._ollama_call = ORIGINAL_OLLAMA_CALL
+    llm._lm_studio_call = ORIGINAL_LM_STUDIO_CALL
+    llm._bedrock_call = ORIGINAL_BEDROCK_CALL
+    llm._codex_call = ORIGINAL_CODEX_CALL
     shutil.rmtree(TEST_ROOT, ignore_errors=True)
 
 
@@ -146,6 +157,89 @@ def test_extract_memory_metadata_normalizes_values() -> None:
         "extract_memory_metadata_normalizes_values",
         f"Unexpected metadata: {meta.model_dump()}",
     )
+
+
+def assert_llm_dispatch(backend: str, expected: str, name: str) -> None:
+    calls = {}
+
+    def make_spy(spy_name: str):
+        def spy(system: str, user: str) -> str:
+            calls[spy_name] = {"system": system, "user": user}
+            return spy_name
+
+        return spy
+
+    llm.llm_call = ORIGINAL_LLM_CALL
+    llm.LLM_BACKEND = backend
+    llm._ollama_call = make_spy("ollama")
+    llm._lm_studio_call = make_spy("lm-studio")
+    llm._bedrock_call = make_spy("bedrock")
+    llm._codex_call = make_spy("codex")
+
+    result = llm.llm_call("sys", "usr")
+    if (
+        result == expected
+        and list(calls.keys()) == [expected]
+        and calls[expected] == {"system": "sys", "user": "usr"}
+    ):
+        ok(name)
+    else:
+        fail(name, f"backend={backend!r} result={result!r} calls={calls!r}")
+
+
+def test_llm_call_dispatches_ollama_backend() -> None:
+    assert_llm_dispatch("ollama", "ollama", "llm_call_dispatches_ollama_backend")
+
+
+def test_llm_call_dispatches_unknown_backend_to_ollama() -> None:
+    assert_llm_dispatch(
+        "bogus", "ollama", "llm_call_dispatches_unknown_backend_to_ollama"
+    )
+
+
+def test_llm_call_dispatches_lm_studio_backend() -> None:
+    assert_llm_dispatch(
+        "lm-studio", "lm-studio", "llm_call_dispatches_lm_studio_backend"
+    )
+
+
+def test_llm_call_dispatches_lmstudio_alias() -> None:
+    assert_llm_dispatch("lmstudio", "lm-studio", "llm_call_dispatches_lmstudio_alias")
+
+
+def test_llm_call_dispatches_bedrock_backend() -> None:
+    assert_llm_dispatch("bedrock", "bedrock", "llm_call_dispatches_bedrock_backend")
+
+
+def test_llm_call_dispatches_codex_backend() -> None:
+    assert_llm_dispatch("codex", "codex", "llm_call_dispatches_codex_backend")
+
+
+def test_llm_safe_fallbacks_when_llm_call_raises() -> None:
+    def raising_llm_call(system: str, user: str) -> str:
+        raise RuntimeError("offline failure")
+
+    llm.llm_call = raising_llm_call
+    metadata = llm.extract_memory_metadata("remember the fallback", "global", [])
+    candidates = [
+        MemoryRecord(id="mem-1", content="first memory", importance=5),
+        MemoryRecord(id="mem-2", content="second memory", importance=4),
+        MemoryRecord(id="mem-3", content="third memory", importance=3),
+    ]
+    ranked = llm.rank_memories("memory", candidates, 2)
+
+    if (
+        metadata.category == "project_knowledge"
+        and metadata.importance == 3
+        and metadata.tags == ""
+        and ranked == candidates[:2]
+    ):
+        ok("llm_safe_fallbacks_when_llm_call_raises")
+    else:
+        fail(
+            "llm_safe_fallbacks_when_llm_call_raises",
+            f"metadata={metadata.model_dump()} ranked={ranked!r}",
+        )
 
 
 def test_memory_query_clamps_limit() -> None:
@@ -1190,6 +1284,13 @@ if __name__ == "__main__":
     try:
         test_extract_memory_metadata_defaults()
         test_extract_memory_metadata_normalizes_values()
+        test_llm_call_dispatches_ollama_backend()
+        test_llm_call_dispatches_unknown_backend_to_ollama()
+        test_llm_call_dispatches_lm_studio_backend()
+        test_llm_call_dispatches_lmstudio_alias()
+        test_llm_call_dispatches_bedrock_backend()
+        test_llm_call_dispatches_codex_backend()
+        test_llm_safe_fallbacks_when_llm_call_raises()
         test_memory_query_clamps_limit()
         test_memory_query_tracks_access()
         test_memory_consolidate_ignores_invalid_actions()

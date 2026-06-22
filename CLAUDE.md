@@ -15,7 +15,7 @@ The server is registered in `~/.mcp.json` and started automatically by Claude Co
 .venv/bin/python -m mcp_memory_agent
 
 # Integration tests — exercise the live LLM. Default backend is Ollama (qwen2.5:14b);
-# set LLM_BACKEND=bedrock to use AWS instead.
+# set LLM_BACKEND=lm-studio, bedrock, or codex to switch.
 .venv/bin/python tests/test_integration.py
 
 # Pure-local validation tests — patch llm.llm_call with a mock, no LLM required.
@@ -36,7 +36,7 @@ The codebase is small and procedural; `models/` is the only package.
 | `src/mcp_memory_agent/server.py` | Entry point: `db.init_db()` then `mcp.run()`.       |
 | `src/mcp_memory_agent/tools.py` | `FastMCP` app + 14 `@mcp.tool()` handlers, plus `_insert_memory` / `_gather_candidates` shared helpers. |
 | `src/mcp_memory_agent/db.py` | SQLite path/init, FTS upsert/delete, query-term extraction, archive and lifecycle helpers. |
-| `src/mcp_memory_agent/llm.py` | LLM dispatch (Ollama / LM Studio / Bedrock), JSON extraction, ranking. |
+| `src/mcp_memory_agent/llm.py` | LLM dispatch (Ollama / LM Studio / Bedrock / Codex), JSON extraction, ranking. |
 | `src/mcp_memory_agent/hook_handler.py` | Client hook entrypoint: `inject-context`, `record`, `summarize-session`, `finalize-session`, `sweep`, `curator`. Always exits 0. |
 | `src/mcp_memory_agent/integrations/` | Claude and Codex installer adapters.                |
 | `src/mcp_memory_agent/install.py` | Idempotent installer for Claude, Codex, or both.     |
@@ -49,7 +49,9 @@ The codebase is small and procedural; `models/` is the only package.
 `llm.llm_call(system, user)` dispatches based on `LLM_BACKEND`:
 
 - `ollama` (default): POSTs to `OLLAMA_URL` (default `http://localhost:11434`), model `OLLAMA_MODEL` (default `qwen2.5:14b`).
+- `lm-studio` / `lmstudio`: POSTs to the OpenAI-compatible `LM_STUDIO_URL` (default `http://localhost:1234`), model `LM_STUDIO_MODEL` (default `qwen3-4b-instruct-2507-mlx`), with `LM_STUDIO_MAX_TOKENS` (default `4096`).
 - `bedrock`: lazy `boto3` client, `BEDROCK_MODEL` (default `us.anthropic.claude-3-5-haiku-20241022-v1:0`), `AWS_REGION` (default `us-east-1`), `AWS_PROFILE` optional.
+- `codex`: shells out to non-interactive `codex exec` for cloud summarization, with `CODEX_BIN` (optional explicit binary path), `CODEX_MODEL` (empty uses the Codex CLI default), `CODEX_REASONING` (default `low`), and `CODEX_TIMEOUT` seconds (default `180`).
 
 LLM responses are parsed with `extract_json_object` / `extract_json_array` (find first `{...}` / `[...]`), then validated through Pydantic models. LLM failures are swallowed and fall back to safe defaults — no `raise` propagates out of `llm.py`.
 
