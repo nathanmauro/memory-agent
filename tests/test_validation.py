@@ -999,6 +999,365 @@ def test_memory_list_and_timeline_exclude_stale_by_default() -> None:
         )
 
 
+def test_hook_derive_scope_uses_git_root_or_path_basename() -> None:
+    with tempfile.TemporaryDirectory() as root:
+        repo = os.path.abspath(os.path.join(root, "repo-alpha"))
+        nested = os.path.join(repo, "nested", "child")
+        no_git = os.path.abspath(os.path.join(root, "plain-leaf"))
+        os.makedirs(os.path.join(repo, ".git"), exist_ok=True)
+        os.makedirs(nested, exist_ok=True)
+        os.makedirs(no_git, exist_ok=True)
+
+        git_scope = hook_handler._derive_scope(nested)
+        path_scope = hook_handler._derive_scope(no_git)
+        empty_scope = hook_handler._derive_scope("")
+        non_string_scope = hook_handler._derive_scope(123)
+
+        assert_result(
+            "hook_derive_scope_uses_git_root_or_path_basename",
+            git_scope == "repo-alpha"
+            and path_scope == "plain-leaf"
+            and empty_scope == "global"
+            and non_string_scope == "global",
+            (
+                f"git={git_scope!r} path={path_scope!r} empty={empty_scope!r} "
+                f"non_string={non_string_scope!r}"
+            ),
+        )
+
+
+def test_hook_payload_value_respects_precedence_and_defaults() -> None:
+    payload = {
+        "first": "",
+        "second": None,
+        "third": "selected",
+        "fourth": "ignored",
+    }
+    selected = hook_handler._payload_value(payload, ["first", "second", "third"])
+    early = hook_handler._payload_value(payload, ["fourth", "third"])
+    missing = hook_handler._payload_value(payload, ["missing", "first"], "fallback")
+
+    assert_result(
+        "hook_payload_value_respects_precedence_and_defaults",
+        selected == "selected" and early == "ignored" and missing == "fallback",
+        f"selected={selected!r} early={early!r} missing={missing!r}",
+    )
+
+
+def test_hook_payload_cwd_aliases_and_pwd_fallback() -> None:
+    original_pwd = os.environ.get("PWD")
+    try:
+        os.environ["PWD"] = "/tmp/pwd-fallback"
+        aliases = [
+            ("cwd", "/tmp/cwd"),
+            ("workdir", "/tmp/workdir"),
+            ("working_dir", "/tmp/working-dir"),
+            ("workingDirectory", "/tmp/working-directory"),
+        ]
+        alias_results = [
+            hook_handler._payload_cwd({key: value})
+            for key, value in aliases
+        ]
+        precedence = hook_handler._payload_cwd(
+            {"cwd": "", "workdir": "/tmp/workdir-selected"}
+        )
+        fallback = hook_handler._payload_cwd({})
+
+        assert_result(
+            "hook_payload_cwd_aliases_and_pwd_fallback",
+            alias_results
+            == [
+                "/tmp/cwd",
+                "/tmp/workdir",
+                "/tmp/working-dir",
+                "/tmp/working-directory",
+            ]
+            and precedence == "/tmp/workdir-selected"
+            and fallback == "/tmp/pwd-fallback",
+            (
+                f"aliases={alias_results!r} precedence={precedence!r} "
+                f"fallback={fallback!r}"
+            ),
+        )
+    finally:
+        if original_pwd is None:
+            os.environ.pop("PWD", None)
+        else:
+            os.environ["PWD"] = original_pwd
+
+
+def test_hook_payload_session_id_aliases_and_env_fallback() -> None:
+    env_keys = [
+        "MEMORY_AGENT_SESSION_ID",
+        "CLAUDE_SESSION_ID",
+        "CODEX_SESSION_ID",
+    ]
+    original_env = {key: os.environ.get(key) for key in env_keys}
+    try:
+        for key in env_keys:
+            os.environ.pop(key, None)
+
+        aliases = [
+            ("session_id", "session-a"),
+            ("sessionId", "session-b"),
+            ("conversation_id", "conversation-a"),
+            ("conversationId", "conversation-b"),
+            ("thread_id", "thread-a"),
+            ("threadId", "thread-b"),
+        ]
+        alias_results = [
+            hook_handler._payload_session_id({key: value})
+            for key, value in aliases
+        ]
+        no_fallback = hook_handler._payload_session_id({})
+
+        os.environ["MEMORY_AGENT_SESSION_ID"] = "memory-env"
+        os.environ["CLAUDE_SESSION_ID"] = "claude-env"
+        os.environ["CODEX_SESSION_ID"] = "codex-env"
+        env_fallback = hook_handler._payload_session_id({})
+
+        assert_result(
+            "hook_payload_session_id_aliases_and_env_fallback",
+            alias_results
+            == [
+                "session-a",
+                "session-b",
+                "conversation-a",
+                "conversation-b",
+                "thread-a",
+                "thread-b",
+            ]
+            and no_fallback == ""
+            and env_fallback == "memory-env",
+            (
+                f"aliases={alias_results!r} no_fallback={no_fallback!r} "
+                f"env_fallback={env_fallback!r}"
+            ),
+        )
+    finally:
+        for key, value in original_env.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+
+
+def test_hook_truncate_limits_strings_dicts_and_lists() -> None:
+    long_string = hook_handler._truncate("abcdef", limit=3)
+    unchanged_string = hook_handler._truncate("abc", limit=3)
+    truncated_dict = hook_handler._truncate(
+        {f"k{idx}": "abcdef" for idx in range(25)}, limit=2
+    )
+    truncated_list = hook_handler._truncate(["abcdef" for _ in range(25)], limit=2)
+    passthrough = hook_handler._truncate(42, limit=2)
+
+    assert_result(
+        "hook_truncate_limits_strings_dicts_and_lists",
+        long_string == "abc" + "\u2026"
+        and unchanged_string == "abc"
+        and isinstance(truncated_dict, dict)
+        and list(truncated_dict) == [f"k{idx}" for idx in range(20)]
+        and set(truncated_dict.values()) == {"ab" + "\u2026"}
+        and truncated_list == ["ab" + "\u2026" for _ in range(20)]
+        and passthrough == 42,
+        (
+            f"long={long_string!r} unchanged={unchanged_string!r} "
+            f"dict_len={len(truncated_dict) if isinstance(truncated_dict, dict) else None} "
+            f"list_len={len(truncated_list) if isinstance(truncated_list, list) else None} "
+            f"passthrough={passthrough!r}"
+        ),
+    )
+
+
+def test_hook_session_path_sanitizes_ids_under_sessions_dir() -> None:
+    original_sessions_dir = db.SESSIONS_DIR
+    with tempfile.TemporaryDirectory() as root:
+        try:
+            db.SESSIONS_DIR = os.path.join(root, "sessions")
+            path = hook_handler._session_path("ab c/!D-_")
+            non_string = hook_handler._session_path(123)
+            empty_safe = hook_handler._session_path(" !/")
+
+            assert_result(
+                "hook_session_path_sanitizes_ids_under_sessions_dir",
+                path == os.path.join(db.SESSIONS_DIR, "abcD-_.jsonl")
+                and os.path.commonpath([path, db.SESSIONS_DIR]) == db.SESSIONS_DIR
+                and non_string is None
+                and empty_safe is None,
+                f"path={path!r} non_string={non_string!r} empty={empty_safe!r}",
+            )
+        finally:
+            db.SESSIONS_DIR = original_sessions_dir
+
+
+def test_hook_append_event_writes_prompt_and_tool_use_only() -> None:
+    original_sessions_dir = db.SESSIONS_DIR
+    with tempfile.TemporaryDirectory() as root:
+        try:
+            db.SESSIONS_DIR = os.path.join(root, "sessions")
+            repo = os.path.join(root, "repo-scope")
+            nested = os.path.join(repo, "nested")
+            os.makedirs(os.path.join(repo, ".git"), exist_ok=True)
+            os.makedirs(nested, exist_ok=True)
+
+            hook_handler._append_event(
+                {
+                    "session_id": "prompt session!/1",
+                    "cwd": nested,
+                    "prompt": "remember this",
+                },
+                "prompt",
+            )
+            prompt_path = os.path.join(db.SESSIONS_DIR, "promptsession1.jsonl")
+            with open(prompt_path) as f:
+                prompt_lines = f.readlines()
+            prompt_event = json.loads(prompt_lines[0])
+
+            hook_handler._append_event(
+                {
+                    "session_id": "tool-session_2",
+                    "cwd": nested,
+                    "tool_name": "Bash",
+                    "tool_input": {"cmd": "pwd"},
+                    "tool_response": {"stdout": nested},
+                },
+                "tool_use",
+            )
+            tool_path = os.path.join(db.SESSIONS_DIR, "tool-session_2.jsonl")
+            with open(tool_path) as f:
+                tool_lines = f.readlines()
+            tool_event = json.loads(tool_lines[0])
+
+            hook_handler._append_event(
+                {
+                    "session_id": "unknown !/session",
+                    "cwd": nested,
+                    "prompt": "do not write",
+                },
+                "unknown",
+            )
+            unknown_path = os.path.join(db.SESSIONS_DIR, "unknownsession.jsonl")
+
+            assert_result(
+                "hook_append_event_writes_prompt_and_tool_use_only",
+                len(prompt_lines) == 1
+                and prompt_event["kind"] == "prompt"
+                and prompt_event["scope"] == "repo-scope"
+                and prompt_event["data"] == {"prompt": "remember this"}
+                and len(tool_lines) == 1
+                and tool_event["kind"] == "tool_use"
+                and tool_event["scope"] == "repo-scope"
+                and tool_event["data"]["tool_name"] == "Bash"
+                and tool_event["data"]["tool_input"] == {"cmd": "pwd"}
+                and not os.path.exists(unknown_path),
+                (
+                    f"prompt_lines={len(prompt_lines)} prompt={prompt_event!r} "
+                    f"tool_lines={len(tool_lines)} tool={tool_event!r} "
+                    f"unknown_exists={os.path.exists(unknown_path)!r}"
+                ),
+            )
+        finally:
+            db.SESSIONS_DIR = original_sessions_dir
+
+
+def test_hook_read_buffer_skips_invalid_lines_and_missing_files() -> None:
+    with tempfile.TemporaryDirectory() as root:
+        path = os.path.join(root, "buffer.jsonl")
+        with open(path, "w") as f:
+            f.write(json.dumps({"kind": "prompt"}) + "\n")
+            f.write("\n")
+            f.write("not json\n")
+            f.write(json.dumps(["not", "a", "dict"]) + "\n")
+            f.write(json.dumps({"kind": "tool_use"}) + "\n")
+
+        events = hook_handler._read_buffer(path)
+        missing = hook_handler._read_buffer(os.path.join(root, "missing.jsonl"))
+
+        assert_result(
+            "hook_read_buffer_skips_invalid_lines_and_missing_files",
+            events == [{"kind": "prompt"}, {"kind": "tool_use"}] and missing == [],
+            f"events={events!r} missing={missing!r}",
+        )
+
+
+def test_hook_remove_buffer_deletes_existing_and_ignores_missing() -> None:
+    with tempfile.TemporaryDirectory() as root:
+        path = os.path.join(root, "buffer.jsonl")
+        with open(path, "w") as f:
+            f.write("event\n")
+
+        hook_handler._remove_buffer(path)
+        removed = not os.path.exists(path)
+        hook_handler._remove_buffer(path)
+
+        assert_result(
+            "hook_remove_buffer_deletes_existing_and_ignores_missing",
+            removed and not os.path.exists(path),
+            f"removed={removed!r} exists={os.path.exists(path)!r}",
+        )
+
+
+def test_hook_build_transcript_formats_limits_and_caps_events() -> None:
+    events = [
+        {"kind": "prompt", "data": {"prompt": "first"}},
+        {"kind": "tool_use", "data": {"tool_name": "Bash", "tool_input": {"cmd": "pwd"}}},
+        {"kind": "note", "data": {"detail": "ignored"}},
+    ]
+    transcript = hook_handler._build_transcript(events, max_chars=200)
+    limited = hook_handler._build_transcript(events, max_chars=12)
+    many_events = [
+        {"kind": "prompt", "data": {"prompt": f"event-{idx}"}}
+        for idx in range(201)
+    ]
+    capped = hook_handler._build_transcript(many_events, max_chars=10000)
+
+    assert_result(
+        "hook_build_transcript_formats_limits_and_caps_events",
+        transcript == 'USER: first\nTOOL Bash: {"cmd": "pwd"}'
+        and limited == "USER: first"
+        and "event-199" in capped
+        and "event-200" not in capped,
+        (
+            f"transcript={transcript!r} limited={limited!r} "
+            f"contains199={'event-199' in capped} contains200={'event-200' in capped}"
+        ),
+    )
+
+
+def test_hook_parse_string_list_filters_and_caps_items() -> None:
+    non_list = hook_handler._parse_string_list("not-a-list")
+    parsed = hook_handler._parse_string_list(
+        [None, "", " alpha ", "beta", " ", "gamma", "delta"]
+    )
+
+    assert_result(
+        "hook_parse_string_list_filters_and_caps_items",
+        non_list == [] and parsed == ["alpha", "beta", "gamma"],
+        f"non_list={non_list!r} parsed={parsed!r}",
+    )
+
+
+def test_hook_parse_memory_item_accepts_strings_and_dicts() -> None:
+    from_string = hook_handler._parse_memory_item("  remember me  ")
+    from_dict = hook_handler._parse_memory_item(
+        {"content": "  stored content  ", "tags": "  one,two  "}
+    )
+    bad_dict = hook_handler._parse_memory_item({"content": 123, "tags": ["one"]})
+    junk = hook_handler._parse_memory_item(["not", "valid"])
+
+    assert_result(
+        "hook_parse_memory_item_accepts_strings_and_dicts",
+        from_string == ("remember me", "")
+        and from_dict == ("stored content", "one,two")
+        and bad_dict == ("", "")
+        and junk == ("", ""),
+        (
+            f"string={from_string!r} dict={from_dict!r} "
+            f"bad_dict={bad_dict!r} junk={junk!r}"
+        ),
+    )
+
+
 def _write_summarize_buffer(session_id: str, event_count: int = 4) -> str:
     buffer_path = os.path.join(db.SESSIONS_DIR, f"{session_id}.jsonl")
     os.makedirs(db.SESSIONS_DIR, exist_ok=True)
@@ -2117,6 +2476,18 @@ if __name__ == "__main__":
         test_memory_get_full_and_prefix()
         test_memory_timeline_orders_and_filters()
         test_memory_list_and_timeline_exclude_stale_by_default()
+        test_hook_derive_scope_uses_git_root_or_path_basename()
+        test_hook_payload_value_respects_precedence_and_defaults()
+        test_hook_payload_cwd_aliases_and_pwd_fallback()
+        test_hook_payload_session_id_aliases_and_env_fallback()
+        test_hook_truncate_limits_strings_dicts_and_lists()
+        test_hook_session_path_sanitizes_ids_under_sessions_dir()
+        test_hook_append_event_writes_prompt_and_tool_use_only()
+        test_hook_read_buffer_skips_invalid_lines_and_missing_files()
+        test_hook_remove_buffer_deletes_existing_and_ignores_missing()
+        test_hook_build_transcript_formats_limits_and_caps_events()
+        test_hook_parse_string_list_filters_and_caps_items()
+        test_hook_parse_memory_item_accepts_strings_and_dicts()
         test_hook_summarize_inserts_memory()
         test_hook_summarize_stores_open_actions()
         test_hook_summarize_handles_noisy_open_actions()
