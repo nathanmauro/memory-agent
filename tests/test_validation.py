@@ -5,12 +5,14 @@ Run: python -m tests.test_validation  (or `pytest tests/test_validation.py`)
 
 import json
 import os
+import shlex
 import shutil
 import subprocess
 import tempfile
 from datetime import UTC, datetime, timedelta
 
 from mcp_memory_agent import db, hook_handler, hot, llm, tools
+from mcp_memory_agent.integrations import claude, codex
 from mcp_memory_agent.models import MemoryRecord
 
 PASS = 0
@@ -41,6 +43,8 @@ ORIGINAL_CODEX_CALL = llm._codex_call
 ORIGINAL_CODEX_BIN = llm.CODEX_BIN
 ORIGINAL_CODEX_MODEL = llm.CODEX_MODEL
 ORIGINAL_CODEX_REASONING = llm.CODEX_REASONING
+ORIGINAL_CLAUDE_SETTINGS_PATH = claude.SETTINGS_PATH
+ORIGINAL_CLAUDE_SETTINGS_BACKUP = claude.SETTINGS_BACKUP
 
 
 def ok(name: str) -> None:
@@ -87,7 +91,50 @@ def restore_state() -> None:
     llm.CODEX_BIN = ORIGINAL_CODEX_BIN
     llm.CODEX_MODEL = ORIGINAL_CODEX_MODEL
     llm.CODEX_REASONING = ORIGINAL_CODEX_REASONING
+    claude.SETTINGS_PATH = ORIGINAL_CLAUDE_SETTINGS_PATH
+    claude.SETTINGS_BACKUP = ORIGINAL_CLAUDE_SETTINGS_BACKUP
     shutil.rmtree(TEST_ROOT, ignore_errors=True)
+
+
+def assert_result(name: str, condition: bool, reason: str) -> None:
+    if condition:
+        ok(name)
+        return
+    fail(name, reason)
+    assert condition, reason
+
+
+def redirect_claude_settings(root: str) -> None:
+    claude.SETTINGS_PATH = os.path.join(root, ".claude", "settings.json")
+    claude.SETTINGS_BACKUP = claude.SETTINGS_PATH + ".bak"
+
+
+def restore_claude_settings() -> None:
+    claude.SETTINGS_PATH = ORIGINAL_CLAUDE_SETTINGS_PATH
+    claude.SETTINGS_BACKUP = ORIGINAL_CLAUDE_SETTINGS_BACKUP
+
+
+def assert_claude_settings_in_tempdir(root: str) -> None:
+    settings_path = os.path.abspath(claude.SETTINGS_PATH)
+    temp_root = os.path.abspath(root)
+    assert os.path.commonpath([settings_path, temp_root]) == temp_root
+
+
+def snapshot_codex_env() -> dict[str, str | None]:
+    return {key: os.environ.get(key) for key in codex.ENV_KEYS}
+
+
+def clear_codex_env() -> None:
+    for key in codex.ENV_KEYS:
+        os.environ.pop(key, None)
+
+
+def restore_codex_env(snapshot: dict[str, str | None]) -> None:
+    for key, value in snapshot.items():
+        if value is None:
+            os.environ.pop(key, None)
+        else:
+            os.environ[key] = value
 
 
 def insert_memory(
@@ -442,6 +489,239 @@ def test_codex_call_builds_offline_argv_and_cleans_output() -> None:
             os.environ.pop("CODEX_EXTRA_ARGS", None)
         else:
             os.environ["CODEX_EXTRA_ARGS"] = original_extra
+
+
+def test_claude_load_settings_returns_empty_for_missing_and_bad_json() -> None:
+    name = "claude_load_settings_returns_empty_for_missing_and_bad_json"
+    with tempfile.TemporaryDirectory() as root:
+        try:
+            redirect_claude_settings(root)
+            missing = claude.load_settings()
+
+            os.makedirs(os.path.dirname(claude.SETTINGS_PATH), exist_ok=True)
+            with open(claude.SETTINGS_PATH, "w") as f:
+                f.write("{bad json")
+            corrupt = claude.load_settings()
+
+            with open(claude.SETTINGS_PATH, "w") as f:
+                json.dump(["not", "a", "dict"], f)
+            non_dict = claude.load_settings()
+
+            assert_result(
+                name,
+                missing == {} and corrupt == {} and non_dict == {},
+                f"missing={missing!r} corrupt={corrupt!r} non_dict={non_dict!r}",
+            )
+        finally:
+            restore_claude_settings()
+
+
+def test_claude_entry_has_command_matches_only_list_hooks() -> None:
+    command = "mcp-memory-agent-hook record --kind prompt"
+    matching = {"hooks": [{"type": "command", "command": command}]}
+    non_matching = {"hooks": [{"type": "command", "command": "other"}]}
+    non_list_hooks = {"hooks": {"type": "command", "command": command}}
+
+    assert_result(
+        "claude_entry_has_command_matches_only_list_hooks",
+        claude.entry_has_command(matching, command)
+        and not claude.entry_has_command(non_matching, command)
+        and not claude.entry_has_command(non_list_hooks, command),
+        (
+            f"matching={claude.entry_has_command(matching, command)!r} "
+            f"non_matching={claude.entry_has_command(non_matching, command)!r} "
+            f"non_list={claude.entry_has_command(non_list_hooks, command)!r}"
+        ),
+    )
+
+
+def test_claude_install_hooks_adds_all_events_and_is_idempotent() -> None:
+    name = "claude_install_hooks_adds_all_events_and_is_idempotent"
+    with tempfile.TemporaryDirectory() as root:
+        try:
+            redirect_claude_settings(root)
+            assert_claude_settings_in_tempdir(root)
+            added = claude.install_hooks()
+            assert_claude_settings_in_tempdir(root)
+            second_added = claude.install_hooks()
+
+            with open(claude.SETTINGS_PATH) as f:
+                settings = json.load(f)
+            hooks = settings.get("hooks", {})
+            expected = {
+                event: [claude.hook_command(args) for args in arg_lists]
+                for event, arg_lists in claude.HOOK_EVENTS.items()
+            }
+            actual = {
+                event: [
+                    entry["hooks"][0]["command"]
+                    for entry in hooks.get(event, [])
+                    if isinstance(entry, dict) and entry.get("hooks")
+                ]
+                for event in claude.HOOK_EVENTS
+            }
+
+            assert_result(
+                name,
+                added == 5
+                and second_added == 0
+                and set(claude.HOOK_EVENTS).issubset(hooks)
+                and len(hooks.get("SessionStart", [])) == 2
+                and actual == expected,
+                (
+                    f"added={added} second={second_added} "
+                    f"events={list(hooks.keys())!r} actual={actual!r} expected={expected!r}"
+                ),
+            )
+        finally:
+            restore_claude_settings()
+
+
+def test_claude_backup_settings_copies_existing_settings() -> None:
+    name = "claude_backup_settings_copies_existing_settings"
+    with tempfile.TemporaryDirectory() as root:
+        try:
+            redirect_claude_settings(root)
+            os.makedirs(os.path.dirname(claude.SETTINGS_PATH), exist_ok=True)
+            with open(claude.SETTINGS_PATH, "w") as f:
+                json.dump({"hooks": {"Existing": []}}, f)
+
+            assert_claude_settings_in_tempdir(root)
+            claude.backup_settings()
+
+            with open(claude.SETTINGS_BACKUP) as f:
+                backup = json.load(f)
+            assert_result(
+                name,
+                backup == {"hooks": {"Existing": []}},
+                f"backup={backup!r} path={claude.SETTINGS_BACKUP!r}",
+            )
+        finally:
+            restore_claude_settings()
+
+
+def test_codex_load_hooks_returns_default_for_missing_and_bad_shapes() -> None:
+    name = "codex_load_hooks_returns_default_for_missing_and_bad_shapes"
+    with tempfile.TemporaryDirectory() as root:
+        path = os.path.join(root, ".codex", "hooks.json")
+        missing = codex.load_hooks(path)
+
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w") as f:
+            f.write("{bad json")
+        corrupt = codex.load_hooks(path)
+
+        with open(path, "w") as f:
+            json.dump(["not", "a", "dict"], f)
+        non_dict = codex.load_hooks(path)
+
+        with open(path, "w") as f:
+            json.dump({"hooks": ["bad"], "keep": True}, f)
+        bad_hooks = codex.load_hooks(path)
+
+        assert_result(
+            name,
+            missing == {"hooks": {}}
+            and corrupt == {"hooks": {}}
+            and non_dict == {"hooks": {}}
+            and bad_hooks == {"hooks": {}, "keep": True},
+            (
+                f"missing={missing!r} corrupt={corrupt!r} "
+                f"non_dict={non_dict!r} bad_hooks={bad_hooks!r}"
+            ),
+        )
+
+
+def test_codex_install_hooks_writes_all_events_and_is_idempotent() -> None:
+    name = "codex_install_hooks_writes_all_events_and_is_idempotent"
+    env_snapshot = snapshot_codex_env()
+    with tempfile.TemporaryDirectory() as root:
+        try:
+            clear_codex_env()
+            added = codex.install_hooks(root)
+            second_added = codex.install_hooks(root)
+            path = codex.hook_path(root)
+
+            with open(path) as f:
+                data = json.load(f)
+            hooks = data.get("hooks", {})
+            expected = {
+                event: [
+                    (spec.get("matcher", ""), codex.hook_command(spec["args"]))
+                    for spec in specs
+                ]
+                for event, specs in codex.HOOK_EVENTS.items()
+            }
+            actual = {
+                event: [
+                    (entry.get("matcher", ""), entry["hooks"][0]["command"])
+                    for entry in hooks.get(event, [])
+                    if isinstance(entry, dict) and entry.get("hooks")
+                ]
+                for event in codex.HOOK_EVENTS
+            }
+            expected_added = sum(len(entries) for entries in codex.HOOK_EVENTS.values())
+
+            assert_result(
+                name,
+                added == expected_added
+                and second_added == 0
+                and os.path.exists(path)
+                and actual == expected,
+                (
+                    f"added={added} expected_added={expected_added} "
+                    f"second={second_added} actual={actual!r} expected={expected!r}"
+                ),
+            )
+        finally:
+            restore_codex_env(env_snapshot)
+
+
+def test_codex_env_helpers_include_only_set_keys_and_quote_commands() -> None:
+    name = "codex_env_helpers_include_only_set_keys_and_quote_commands"
+    env_snapshot = snapshot_codex_env()
+    expected_env = "LLM_BACKEND=lm studio's test"
+    try:
+        clear_codex_env()
+        os.environ["LLM_BACKEND"] = "lm studio's test"
+        env_args = codex.mcp_env_args()
+        prefix = codex.hook_env_command_prefix()
+        command = codex.hook_command(["record", "--kind", "prompt value"])
+        split_command = shlex.split(command)
+
+        assert_result(
+            name,
+            env_args == ["--env", expected_env]
+            and prefix == ["env", expected_env]
+            and expected_env in split_command
+            and split_command[-3:] == ["record", "--kind", "prompt value"]
+            and shlex.quote(expected_env) in command
+            and shlex.quote("prompt value") in command,
+            (
+                f"env_args={env_args!r} prefix={prefix!r} "
+                f"command={command!r} split={split_command!r}"
+            ),
+        )
+    finally:
+        restore_codex_env(env_snapshot)
+
+
+def test_codex_hook_command_quotes_shell_sensitive_args() -> None:
+    name = "codex_hook_command_quotes_shell_sensitive_args"
+    env_snapshot = snapshot_codex_env()
+    try:
+        clear_codex_env()
+        command = codex.hook_command(["record", "--kind", "prompt value", "semi;colon"])
+        split_command = shlex.split(command)
+        assert_result(
+            name,
+            split_command[-4:] == ["record", "--kind", "prompt value", "semi;colon"]
+            and shlex.quote("prompt value") in command
+            and shlex.quote("semi;colon") in command,
+            f"command={command!r} split={split_command!r}",
+        )
+    finally:
+        restore_codex_env(env_snapshot)
 
 
 def test_llm_safe_fallbacks_when_llm_call_raises() -> None:
@@ -1526,6 +1806,14 @@ if __name__ == "__main__":
         test_repair_json_removes_trailing_commas()
         test_resolve_codex_bin_prefers_module_attr_then_path_default()
         test_codex_call_builds_offline_argv_and_cleans_output()
+        test_claude_load_settings_returns_empty_for_missing_and_bad_json()
+        test_claude_entry_has_command_matches_only_list_hooks()
+        test_claude_install_hooks_adds_all_events_and_is_idempotent()
+        test_claude_backup_settings_copies_existing_settings()
+        test_codex_load_hooks_returns_default_for_missing_and_bad_shapes()
+        test_codex_install_hooks_writes_all_events_and_is_idempotent()
+        test_codex_env_helpers_include_only_set_keys_and_quote_commands()
+        test_codex_hook_command_quotes_shell_sensitive_args()
         test_llm_safe_fallbacks_when_llm_call_raises()
         test_memory_query_clamps_limit()
         test_memory_query_tracks_access()
