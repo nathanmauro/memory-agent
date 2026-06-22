@@ -6,8 +6,9 @@ Run: python -m tests.test_validation  (or `pytest tests/test_validation.py`)
 import json
 import os
 import shutil
+import subprocess
 import tempfile
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 
 from mcp_memory_agent import db, hook_handler, hot, llm, tools
 from mcp_memory_agent.models import MemoryRecord
@@ -37,6 +38,9 @@ ORIGINAL_OLLAMA_CALL = llm._ollama_call
 ORIGINAL_LM_STUDIO_CALL = llm._lm_studio_call
 ORIGINAL_BEDROCK_CALL = llm._bedrock_call
 ORIGINAL_CODEX_CALL = llm._codex_call
+ORIGINAL_CODEX_BIN = llm.CODEX_BIN
+ORIGINAL_CODEX_MODEL = llm.CODEX_MODEL
+ORIGINAL_CODEX_REASONING = llm.CODEX_REASONING
 
 
 def ok(name: str) -> None:
@@ -80,6 +84,9 @@ def restore_state() -> None:
     llm._lm_studio_call = ORIGINAL_LM_STUDIO_CALL
     llm._bedrock_call = ORIGINAL_BEDROCK_CALL
     llm._codex_call = ORIGINAL_CODEX_CALL
+    llm.CODEX_BIN = ORIGINAL_CODEX_BIN
+    llm.CODEX_MODEL = ORIGINAL_CODEX_MODEL
+    llm.CODEX_REASONING = ORIGINAL_CODEX_REASONING
     shutil.rmtree(TEST_ROOT, ignore_errors=True)
 
 
@@ -92,7 +99,7 @@ def insert_memory(
     updated_at: str = "",
     pinned: int = 0,
 ) -> None:
-    now = updated_at or datetime.now(timezone.utc).isoformat()
+    now = updated_at or datetime.now(UTC).isoformat()
     conn = db.get_db()
     conn.execute(
         """
@@ -159,6 +166,13 @@ def test_extract_memory_metadata_normalizes_values() -> None:
     )
 
 
+def adjacent_pair(items: list[str], first: str, second: str) -> bool:
+    return any(
+        left == first and right == second
+        for left, right in zip(items, items[1:])
+    )
+
+
 def assert_llm_dispatch(backend: str, expected: str, name: str) -> None:
     calls = {}
 
@@ -213,6 +227,221 @@ def test_llm_call_dispatches_bedrock_backend() -> None:
 
 def test_llm_call_dispatches_codex_backend() -> None:
     assert_llm_dispatch("codex", "codex", "llm_call_dispatches_codex_backend")
+
+
+def test_extract_json_object_parses_common_llm_shapes() -> None:
+    cases = [
+        (
+            "plain",
+            '{"kind": "decision", "score": 2}',
+            {"kind": "decision", "score": 2},
+        ),
+        ("fenced", '```json\n{"kind": "decision"}\n```', {"kind": "decision"}),
+        (
+            "embedded",
+            'Here is the result:\n{"accepted": true}\nDone.',
+            {"accepted": True},
+        ),
+    ]
+    failures = []
+    for label, raw, expected in cases:
+        result = llm.extract_json_object(raw)
+        if result != expected:
+            failures.append(f"{label}={result!r}")
+
+    if not failures:
+        ok("extract_json_object_parses_common_llm_shapes")
+    else:
+        fail("extract_json_object_parses_common_llm_shapes", "; ".join(failures))
+
+
+def test_extract_json_object_repairs_trailing_commas_and_falls_back() -> None:
+    repaired = llm.extract_json_object('{"name": "alpha", "values": [1, 2,],}')
+    no_braces = llm.extract_json_object("no json here")
+    unrepairable = llm.extract_json_object('{"name": }')
+
+    if (
+        repaired == {"name": "alpha", "values": [1, 2]}
+        and no_braces == {}
+        and unrepairable == {}
+    ):
+        ok("extract_json_object_repairs_trailing_commas_and_falls_back")
+    else:
+        fail(
+            "extract_json_object_repairs_trailing_commas_and_falls_back",
+            f"repaired={repaired!r} no_braces={no_braces!r} unrepairable={unrepairable!r}",
+        )
+
+
+def test_extract_json_array_parses_embedded_and_malformed_inputs() -> None:
+    plain = llm.extract_json_array('[1, {"score": 2}]')
+    embedded = llm.extract_json_array("Ranked indices: [3, 0, 1]\nThanks.")
+    malformed = llm.extract_json_array("[1,]")
+
+    if plain == [1, {"score": 2}] and embedded == [3, 0, 1] and malformed == []:
+        ok("extract_json_array_parses_embedded_and_malformed_inputs")
+    else:
+        fail(
+            "extract_json_array_parses_embedded_and_malformed_inputs",
+            f"plain={plain!r} embedded={embedded!r} malformed={malformed!r}",
+        )
+
+
+def test_strip_fences_handles_tags_and_passthrough() -> None:
+    with_tag = llm._strip_fences('```json\n{"a": 1}\n```')
+    without_tag = llm._strip_fences("```\n[1, 2]\n```")
+    passthrough = llm._strip_fences("no fences")
+
+    if (
+        with_tag == '{"a": 1}'
+        and without_tag == "[1, 2]"
+        and passthrough == "no fences"
+    ):
+        ok("strip_fences_handles_tags_and_passthrough")
+    else:
+        fail(
+            "strip_fences_handles_tags_and_passthrough",
+            f"with_tag={with_tag!r} without_tag={without_tag!r} passthrough={passthrough!r}",
+        )
+
+
+def test_repair_json_removes_trailing_commas() -> None:
+    object_repaired = llm._repair_json('{"a": 1,}')
+    array_repaired = llm._repair_json('{"items": [1, 2,]}')
+
+    if object_repaired == '{"a": 1}' and array_repaired == '{"items": [1, 2]}':
+        ok("repair_json_removes_trailing_commas")
+    else:
+        fail(
+            "repair_json_removes_trailing_commas",
+            f"object={object_repaired!r} array={array_repaired!r}",
+        )
+
+
+def test_resolve_codex_bin_prefers_module_attr_then_path_default() -> None:
+    original_bin = llm.CODEX_BIN
+    try:
+        llm.CODEX_BIN = "/tmp/custom-codex"
+        custom = llm._resolve_codex_bin()
+        llm.CODEX_BIN = ""
+        default = llm._resolve_codex_bin()
+        expected_default = shutil.which("codex") or "/opt/homebrew/bin/codex"
+        if custom == "/tmp/custom-codex" and default == expected_default:
+            ok("resolve_codex_bin_prefers_module_attr_then_path_default")
+        else:
+            fail(
+                "resolve_codex_bin_prefers_module_attr_then_path_default",
+                f"custom={custom!r} default={default!r} expected={expected_default!r}",
+            )
+    finally:
+        llm.CODEX_BIN = original_bin
+
+
+def test_codex_call_builds_offline_argv_and_cleans_output() -> None:
+    original_bin = llm.CODEX_BIN
+    original_codex_call = llm._codex_call
+    original_extra = os.environ.get("CODEX_EXTRA_ARGS")
+    original_model = llm.CODEX_MODEL
+    original_reasoning = llm.CODEX_REASONING
+    original_run = subprocess.run
+    calls = []
+    output_path = ""
+
+    def fake_run(
+        cmd: list[str],
+        input: bytes,
+        stdout: int,
+        stderr: int,
+        timeout: int,
+        check: bool,
+    ) -> subprocess.CompletedProcess:
+        nonlocal output_path
+        calls.append(
+            {
+                "check": check,
+                "cmd": cmd,
+                "input": input,
+                "stderr": stderr,
+                "stdout": stdout,
+                "timeout": timeout,
+            }
+        )
+        output_path = cmd[cmd.index("-o") + 1]
+        with open(output_path, "w") as f:
+            f.write("  offline codex result  \n")
+        return subprocess.CompletedProcess(cmd, 0)
+
+    try:
+        llm.CODEX_BIN = "/tmp/fake-codex"
+        llm._codex_call = ORIGINAL_CODEX_CALL
+        llm.CODEX_MODEL = "gpt-test"
+        llm.CODEX_REASONING = "low"
+        os.environ["CODEX_EXTRA_ARGS"] = '--profile test-profile --flag "two words"'
+        subprocess.run = fake_run
+
+        result = llm._codex_call("system prompt", "user prompt")
+        call = calls[0] if calls else {}
+        cmd = call.get("cmd", [])
+        stdin = call.get("input", b"")
+        out_index = cmd.index("-o") if "-o" in cmd else -1
+        output_unlinked = bool(output_path) and not os.path.exists(output_path)
+        prompt_ok = (
+            b"system prompt" in stdin
+            and b"user prompt" in stdin
+            and b"Output only the requested result" in stdin
+        )
+        required = [
+            "exec",
+            "--ignore-user-config",
+            "--skip-git-repo-check",
+            "--ephemeral",
+        ]
+        argv_ok = all(item in cmd for item in required)
+        pairs_ok = (
+            adjacent_pair(cmd, "-s", "read-only")
+            and adjacent_pair(cmd, "-c", 'model_reasoning_effort="low"')
+            and adjacent_pair(cmd, "-m", "gpt-test")
+        )
+        output_arg_ok = (
+            out_index >= 0
+            and out_index + 1 < len(cmd)
+            and cmd[out_index + 1] == output_path
+        )
+        extra_ok = (
+            "--profile" in cmd
+            and "test-profile" in cmd
+            and "--flag" in cmd
+            and "two words" in cmd
+        )
+
+        if (
+            result == "offline codex result"
+            and argv_ok
+            and pairs_ok
+            and output_arg_ok
+            and extra_ok
+            and prompt_ok
+            and output_unlinked
+        ):
+            ok("codex_call_builds_offline_argv_and_cleans_output")
+        else:
+            fail(
+                "codex_call_builds_offline_argv_and_cleans_output",
+                (
+                    f"result={result!r} cmd={cmd!r} prompt_ok={prompt_ok!r} "
+                    f"output_path={output_path!r} output_unlinked={output_unlinked!r}"
+                ),
+            )
+    finally:
+        llm.CODEX_BIN = original_bin
+        llm._codex_call = original_codex_call
+        llm.CODEX_MODEL = original_model
+        llm.CODEX_REASONING = original_reasoning
+        subprocess.run = original_run
+        if original_extra is None:
+            os.environ.pop("CODEX_EXTRA_ARGS", None)
+        else:
+            os.environ["CODEX_EXTRA_ARGS"] = original_extra
 
 
 def test_llm_safe_fallbacks_when_llm_call_raises() -> None:
@@ -405,7 +634,7 @@ def test_memory_get_full_and_prefix() -> None:
 
 def test_memory_timeline_orders_and_filters() -> None:
     reset_db()
-    base = datetime(2026, 5, 1, tzinfo=timezone.utc)
+    base = datetime(2026, 5, 1, tzinfo=UTC)
     for idx in range(3):
         ts = (base + timedelta(days=idx)).isoformat()
         insert_memory(
@@ -446,8 +675,8 @@ def test_memory_timeline_orders_and_filters() -> None:
 
 def test_memory_list_and_timeline_exclude_stale_by_default() -> None:
     reset_db()
-    active_ts = datetime(2026, 5, 1, tzinfo=timezone.utc).isoformat()
-    stale_ts = datetime(2026, 5, 2, tzinfo=timezone.utc).isoformat()
+    active_ts = datetime(2026, 5, 1, tzinfo=UTC).isoformat()
+    stale_ts = datetime(2026, 5, 2, tzinfo=UTC).isoformat()
     insert_memory(
         "61616161-6161-6161-6161-616161616161",
         "status filter active row",
@@ -496,7 +725,7 @@ def _write_summarize_buffer(session_id: str, event_count: int = 4) -> str:
     with open(buffer_path, "w") as f:
         for i in range(event_count):
             event = {
-                "ts": datetime.now(timezone.utc).isoformat(),
+                "ts": datetime.now(UTC).isoformat(),
                 "kind": "prompt" if i % 2 == 0 else "tool_use",
                 "scope": "__validation__",
                 "data": {"prompt": f"do thing {i}"}
@@ -760,8 +989,8 @@ def test_inject_includes_hot_memory() -> None:
     marker = "unique-hot-marker-xyzzy"
     tools.memory_hot_edit(scope, "replace", marker, target="")
 
-    import io
     import contextlib
+    import io
 
     payload = {"cwd": os.path.join(TEST_ROOT, scope)}
     buf = io.StringIO()
@@ -792,8 +1021,8 @@ def test_inject_excludes_unpinned_warm_memory_by_default() -> None:
         importance=5,
     )
 
-    import io
     import contextlib
+    import io
 
     payload = {"cwd": os.path.join(TEST_ROOT, scope)}
     buf = io.StringIO()
@@ -828,8 +1057,8 @@ def test_inject_includes_pinned_warm_memory() -> None:
         pinned=1,
     )
 
-    import io
     import contextlib
+    import io
 
     payload = {"cwd": os.path.join(TEST_ROOT, scope)}
     buf = io.StringIO()
@@ -864,8 +1093,8 @@ def test_memory_pin_enables_startup_inject() -> None:
         fail("memory_pin_enables_startup_inject", f"missing memory_pin: {exc}")
         return
 
-    import io
     import contextlib
+    import io
 
     payload = {"cwd": os.path.join(TEST_ROOT, scope)}
     buf = io.StringIO()
@@ -902,8 +1131,8 @@ def test_memory_unpin_disables_startup_inject() -> None:
         fail("memory_unpin_disables_startup_inject", f"missing memory_unpin: {exc}")
         return
 
-    import io
     import contextlib
+    import io
 
     payload = {"cwd": os.path.join(TEST_ROOT, scope)}
     buf = io.StringIO()
@@ -936,8 +1165,8 @@ def test_large_hot_memory_does_not_crowd_out_pinned_warm_memory() -> None:
         pinned=1,
     )
 
-    import io
     import contextlib
+    import io
 
     payload = {"cwd": os.path.join(TEST_ROOT, scope)}
     buf = io.StringIO()
@@ -971,7 +1200,7 @@ def test_inject_excludes_archive_pointers_by_default() -> None:
         f.write(
             json.dumps(
                 {
-                    "ts": datetime.now(timezone.utc).isoformat(),
+                    "ts": datetime.now(UTC).isoformat(),
                     "kind": "prompt",
                     "scope": scope,
                     "data": {"prompt": marker},
@@ -984,15 +1213,15 @@ def test_inject_excludes_archive_pointers_by_default() -> None:
         conn,
         session_id,
         scope,
-        datetime.now(timezone.utc).isoformat(),
+        datetime.now(UTC).isoformat(),
         archive_path,
         db.build_archive_index_text(archive_path),
     )
     conn.commit()
     conn.close()
 
-    import io
     import contextlib
+    import io
 
     payload = {"cwd": os.path.join(TEST_ROOT, scope)}
     buf = io.StringIO()
@@ -1051,7 +1280,7 @@ def test_memory_consolidate_dry_run_by_default() -> None:
 
 def test_curator_skips_within_interval() -> None:
     reset_db()
-    db.write_curator_last_run(datetime.now(timezone.utc).isoformat())
+    db.write_curator_last_run(datetime.now(UTC).isoformat())
     calls = {"count": 0}
     llm.llm_call = lambda s, u: (calls.update(count=calls["count"] + 1) or "{}")
 
@@ -1065,7 +1294,7 @@ def test_curator_skips_within_interval() -> None:
 
 def test_curator_runs_lifecycle_and_proposal() -> None:
     reset_db()
-    old = (datetime.now(timezone.utc) - timedelta(days=40)).isoformat()
+    old = (datetime.now(UTC) - timedelta(days=40)).isoformat()
     conn = db.get_db()
     conn.execute(
         """
@@ -1119,7 +1348,7 @@ def test_curator_runs_lifecycle_and_proposal() -> None:
 
 def test_lifecycle_stales_old_high_importance_unpinned_memory() -> None:
     reset_db()
-    old = (datetime.now(timezone.utc) - timedelta(days=40)).isoformat()
+    old = (datetime.now(UTC) - timedelta(days=40)).isoformat()
     insert_memory(
         "98989898-9898-9898-9898-989898989898",
         "old high importance unpinned memory",
@@ -1155,7 +1384,7 @@ def test_memory_session_get_returns_transcript() -> None:
         f.write(
             json.dumps(
                 {
-                    "ts": datetime.now(timezone.utc).isoformat(),
+                    "ts": datetime.now(UTC).isoformat(),
                     "kind": "prompt",
                     "scope": "__validation__",
                     "data": {"prompt": prompt_text},
@@ -1168,7 +1397,7 @@ def test_memory_session_get_returns_transcript() -> None:
         conn,
         session_id,
         "__validation__",
-        datetime.now(timezone.utc).isoformat(),
+        datetime.now(UTC).isoformat(),
         archive_path,
         db.build_archive_index_text(archive_path),
     )
@@ -1194,7 +1423,7 @@ def test_memory_session_get_returns_transcript() -> None:
 
 def test_memory_session_get_uses_scope_for_ambiguous_prefix() -> None:
     reset_db()
-    now = datetime.now(timezone.utc).isoformat()
+    now = datetime.now(UTC).isoformat()
     sessions = [
         ("ambiguous-session-alpha", "scope-one", "alpha prompt marker"),
         ("ambiguous-session-beta", "scope-two", "beta prompt marker"),
@@ -1253,7 +1482,7 @@ def test_memory_session_search_finds_archived_content() -> None:
         f.write(
             json.dumps(
                 {
-                    "ts": datetime.now(timezone.utc).isoformat(),
+                    "ts": datetime.now(UTC).isoformat(),
                     "kind": "prompt",
                     "scope": "__validation__",
                     "data": {"prompt": "unique glacier keyword xyzzy"},
@@ -1266,7 +1495,7 @@ def test_memory_session_search_finds_archived_content() -> None:
         conn,
         session_id,
         "__validation__",
-        datetime.now(timezone.utc).isoformat(),
+        datetime.now(UTC).isoformat(),
         archive_path,
         db.build_archive_index_text(archive_path),
     )
@@ -1290,6 +1519,13 @@ if __name__ == "__main__":
         test_llm_call_dispatches_lmstudio_alias()
         test_llm_call_dispatches_bedrock_backend()
         test_llm_call_dispatches_codex_backend()
+        test_extract_json_object_parses_common_llm_shapes()
+        test_extract_json_object_repairs_trailing_commas_and_falls_back()
+        test_extract_json_array_parses_embedded_and_malformed_inputs()
+        test_strip_fences_handles_tags_and_passthrough()
+        test_repair_json_removes_trailing_commas()
+        test_resolve_codex_bin_prefers_module_attr_then_path_default()
+        test_codex_call_builds_offline_argv_and_cleans_output()
         test_llm_safe_fallbacks_when_llm_call_raises()
         test_memory_query_clamps_limit()
         test_memory_query_tracks_access()
