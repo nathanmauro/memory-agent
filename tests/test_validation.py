@@ -1789,6 +1789,297 @@ def test_memory_session_search_finds_archived_content() -> None:
         fail("memory_session_search_finds_archived_content", result)
 
 
+def test_extract_search_terms_filters_and_limits() -> None:
+    reset_db()
+    query = "the ai c++ memory? and db go pipe|danger alpha beta gamma aftercap"
+    terms = db.extract_search_terms(query, 10)
+    limited = db.extract_search_terms(query, 2)
+    unsafe_chars = set("+-:\"*()|?")
+
+    if (
+        terms == ["memory", "pipedanger", "alpha", "beta"]
+        and limited == ["memory", "pipedanger"]
+        and all(not unsafe_chars.intersection(term) for term in terms)
+    ):
+        ok("extract_search_terms_filters_and_limits")
+    else:
+        fail(
+            "extract_search_terms_filters_and_limits",
+            f"terms={terms} limited={limited}",
+        )
+
+
+def test_build_memory_filters_composes_conditions() -> None:
+    reset_db()
+    empty = db.build_memory_filters()
+    filtered = db.build_memory_filters(
+        scope="__validation__",
+        category="project_knowledge",
+        status="stale",
+    )
+    aliased = db.build_memory_filters(scope="global", alias="m", status="active")
+
+    if (
+        empty == ([], [])
+        and filtered
+        == (
+            ["scope = ?", "category = ?", "status = ?"],
+            ["__validation__", "project_knowledge", "stale"],
+        )
+        and aliased == (["m.scope = ?", "m.status = ?"], ["global", "active"])
+    ):
+        ok("build_memory_filters_composes_conditions")
+    else:
+        fail(
+            "build_memory_filters_composes_conditions",
+            f"empty={empty} filtered={filtered} aliased={aliased}",
+        )
+
+
+def test_format_archive_event_outputs_expected_text() -> None:
+    reset_db()
+    ts = "2026-06-22T12:34:56+00:00"
+    prompt = db.format_archive_event(
+        {"ts": ts, "kind": "prompt", "data": {"prompt": "hello memory"}}
+    )
+    tool = db.format_archive_event(
+        {
+            "ts": ts,
+            "kind": "tool_use",
+            "data": {
+                "tool_name": "Read",
+                "tool_input": {"path": "AGENTS.md"},
+                "tool_response": {},
+            },
+        }
+    )
+    generic = db.format_archive_event(
+        {"ts": ts, "kind": "note", "data": {"detail": "done"}}
+    )
+
+    if (
+        prompt == "[2026-06-22T12:34:56] USER: hello memory"
+        and tool == '[2026-06-22T12:34:56] TOOL Read: {"path": "AGENTS.md"}'
+        and generic == '[2026-06-22T12:34:56] note: {"detail": "done"}'
+    ):
+        ok("format_archive_event_outputs_expected_text")
+    else:
+        fail(
+            "format_archive_event_outputs_expected_text",
+            f"prompt={prompt!r} tool={tool!r} generic={generic!r}",
+        )
+
+
+def test_flatten_archive_line_outputs_index_text() -> None:
+    reset_db()
+    prompt = db.flatten_archive_line(
+        json.dumps({"kind": "prompt", "data": {"prompt": "hello memory"}})
+    )
+    tool = db.flatten_archive_line(
+        json.dumps(
+            {
+                "kind": "tool_use",
+                "data": {
+                    "tool_name": "Bash",
+                    "tool_input": {"cmd": "git status"},
+                    "tool_response": {"stdout": "clean"},
+                },
+            }
+        )
+    )
+    passthrough = db.flatten_archive_line("not json at all")
+
+    if (
+        prompt == "prompt hello memory"
+        and tool == 'tool_use Bash {"cmd": "git status"} {"stdout": "clean"}'
+        and passthrough == "not json at all"
+    ):
+        ok("flatten_archive_line_outputs_index_text")
+    else:
+        fail(
+            "flatten_archive_line_outputs_index_text",
+            f"prompt={prompt!r} tool={tool!r} passthrough={passthrough!r}",
+        )
+
+
+def test_build_archive_index_text_flattens_file() -> None:
+    reset_db()
+    archive_path = db.archive_session_path("__validation__", "index-text-001")
+    os.makedirs(os.path.dirname(archive_path), exist_ok=True)
+    with open(archive_path, "w") as f:
+        f.write(
+            json.dumps({"kind": "prompt", "data": {"prompt": "index alpha"}})
+            + "\n"
+        )
+        f.write("\n")
+        f.write(
+            json.dumps(
+                {
+                    "kind": "tool_use",
+                    "data": {"tool_name": "Bash", "tool_input": {"cmd": "pwd"}},
+                }
+            )
+            + "\n"
+        )
+        f.write("plain transcript line\n")
+
+    text = db.build_archive_index_text(archive_path)
+    expected = "\n".join(
+        [
+            "prompt index alpha",
+            'tool_use Bash {"cmd": "pwd"}',
+            "plain transcript line",
+        ]
+    )
+
+    if text == expected:
+        ok("build_archive_index_text_flattens_file")
+    else:
+        fail("build_archive_index_text_flattens_file", text)
+
+
+def test_read_archive_transcript_limits_and_missing() -> None:
+    reset_db()
+    ts = "2026-06-22T12:34:56+00:00"
+    archive_path = db.archive_session_path("__validation__", "read-limit-001")
+    os.makedirs(os.path.dirname(archive_path), exist_ok=True)
+    with open(archive_path, "w") as f:
+        f.write(
+            json.dumps(
+                {"ts": ts, "kind": "prompt", "data": {"prompt": "first prompt"}}
+            )
+            + "\n"
+        )
+        f.write(
+            json.dumps(
+                {"ts": ts, "kind": "note", "data": {"detail": "second event"}}
+            )
+            + "\n"
+        )
+        f.write(
+            json.dumps(
+                {"ts": ts, "kind": "prompt", "data": {"prompt": "third prompt"}}
+            )
+            + "\n"
+        )
+
+    transcript = db.read_archive_transcript(archive_path, limit=2)
+    missing = db.read_archive_transcript(os.path.join(TEST_ROOT, "missing.jsonl"))
+    expected = "\n".join(
+        [
+            "[2026-06-22T12:34:56] USER: first prompt",
+            '[2026-06-22T12:34:56] note: {"detail": "second event"}',
+        ]
+    )
+
+    if transcript == expected and missing == "":
+        ok("read_archive_transcript_limits_and_missing")
+    else:
+        fail(
+            "read_archive_transcript_limits_and_missing",
+            f"transcript={transcript!r} missing={missing!r}",
+        )
+
+
+def test_find_session_matches_full_and_prefix() -> None:
+    reset_db()
+    now = datetime.now(UTC).isoformat()
+    session_id = "unique01-session-001"
+    archive_path = db.archive_session_path("__validation__", session_id)
+    os.makedirs(os.path.dirname(archive_path), exist_ok=True)
+    with open(archive_path, "w") as f:
+        f.write(
+            json.dumps(
+                {
+                    "ts": now,
+                    "kind": "prompt",
+                    "scope": "__validation__",
+                    "data": {"prompt": "find session marker"},
+                }
+            )
+            + "\n"
+        )
+
+    conn = db.get_db()
+    db.upsert_session_archive_index(
+        conn,
+        session_id,
+        "__validation__",
+        now,
+        archive_path,
+        db.build_archive_index_text(archive_path),
+    )
+    conn.commit()
+    by_full = db.find_session_matches(conn, session_id, "__validation__")
+    by_prefix = db.find_session_matches(conn, session_id[:8], "__validation__")
+    conn.close()
+
+    if (
+        len(by_full) == 1
+        and by_full[0]["session_id"] == session_id
+        and len(by_prefix) == 1
+        and by_prefix[0]["session_id"] == session_id
+    ):
+        ok("find_session_matches_full_and_prefix")
+    else:
+        fail(
+            "find_session_matches_full_and_prefix",
+            f"by_full={by_full} by_prefix={by_prefix}",
+        )
+
+
+def test_resolve_session_id_requires_single_match() -> None:
+    reset_db()
+    now = datetime.now(UTC).isoformat()
+    sessions = [
+        "dupe0001-session-alpha",
+        "dupe0001-session-beta",
+        "solo0001-session-alpha",
+    ]
+    conn = db.get_db()
+    for session_id in sessions:
+        archive_path = db.archive_session_path("__validation__", session_id)
+        os.makedirs(os.path.dirname(archive_path), exist_ok=True)
+        with open(archive_path, "w") as f:
+            f.write(
+                json.dumps(
+                    {
+                        "ts": now,
+                        "kind": "prompt",
+                        "scope": "__validation__",
+                        "data": {"prompt": f"resolve marker {session_id}"},
+                    }
+                )
+                + "\n"
+            )
+        db.upsert_session_archive_index(
+            conn,
+            session_id,
+            "__validation__",
+            now,
+            archive_path,
+            db.build_archive_index_text(archive_path),
+        )
+    conn.commit()
+
+    unique = db.resolve_session_id(conn, "solo0001", "__validation__")
+    exact = db.resolve_session_id(conn, "dupe0001-session-alpha", "__validation__")
+    ambiguous = db.resolve_session_id(conn, "dupe0001", "__validation__")
+    conn.close()
+
+    if (
+        unique == "solo0001-session-alpha"
+        and exact == "dupe0001-session-alpha"
+        and ambiguous is None
+    ):
+        ok("resolve_session_id_requires_single_match")
+    else:
+        fail(
+            "resolve_session_id_requires_single_match",
+            f"unique={unique!r} exact={exact!r} ambiguous={ambiguous!r}",
+        )
+
+
 if __name__ == "__main__":
     try:
         test_extract_memory_metadata_defaults()
@@ -1844,6 +2135,14 @@ if __name__ == "__main__":
         test_memory_session_get_returns_transcript()
         test_memory_session_get_uses_scope_for_ambiguous_prefix()
         test_memory_session_search_finds_archived_content()
+        test_extract_search_terms_filters_and_limits()
+        test_build_memory_filters_composes_conditions()
+        test_format_archive_event_outputs_expected_text()
+        test_flatten_archive_line_outputs_index_text()
+        test_build_archive_index_text_flattens_file()
+        test_read_archive_transcript_limits_and_missing()
+        test_find_session_matches_full_and_prefix()
+        test_resolve_session_id_requires_single_match()
     finally:
         restore_state()
 
