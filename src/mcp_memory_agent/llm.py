@@ -1,4 +1,4 @@
-"""LLM helpers for the memory agent. Supports Ollama, LM Studio, and Amazon Bedrock backends."""
+"""LLM helpers for the memory agent. Supports Ollama, LM Studio, Amazon Bedrock, and Codex (cloud, no local GPU) backends."""
 
 import json
 import os
@@ -22,6 +22,12 @@ AWS_REGION = os.environ.get("AWS_REGION", "us-east-1")
 BEDROCK_MODEL = os.environ.get(
     "BEDROCK_MODEL", "us.anthropic.claude-3-5-haiku-20241022-v1:0"
 )
+
+# Codex (cloud) summarization backend — keeps inference off the local GPU.
+CODEX_BIN = os.environ.get("CODEX_BIN", "")  # resolved lazily in _codex_call
+CODEX_MODEL = os.environ.get("CODEX_MODEL", "")  # empty -> Codex CLI default
+CODEX_REASONING = os.environ.get("CODEX_REASONING", "low")
+CODEX_TIMEOUT = int(os.environ.get("CODEX_TIMEOUT", "180"))
 
 _bedrock_client = None
 
@@ -94,7 +100,69 @@ def _bedrock_call(system: str, user: str) -> str:
     return response["output"]["message"]["content"][0]["text"]
 
 
+def _resolve_codex_bin() -> str:
+    if CODEX_BIN:
+        return CODEX_BIN
+    import shutil
+
+    return shutil.which("codex") or "/opt/homebrew/bin/codex"
+
+
+def _codex_call(system: str, user: str) -> str:
+    """Cloud summarization via the Codex CLI — keeps inference off the local GPU.
+
+    Runs a lean, non-interactive `codex exec`: user config ignored (no MCP
+    servers or hooks are spun up), read-only sandbox, ephemeral session, low
+    reasoning. The agent's final message is captured via --output-last-message.
+    Raises on failure so callers can fall back / skip gracefully.
+    """
+    import shlex
+    import subprocess
+    import tempfile
+
+    prompt = (
+        f"{system}\n\n{user}\n\n"
+        "Output only the requested result. Do not run commands or use tools."
+    )
+    fd, out_path = tempfile.mkstemp(prefix="codex-mem-", suffix=".txt")
+    os.close(fd)
+    cmd = [
+        _resolve_codex_bin(), "exec",
+        "--ignore-user-config",   # skip MCP servers + hooks: lean, fast, quiet
+        "--skip-git-repo-check",
+        "--ephemeral",            # don't persist a session file per summary
+        "-s", "read-only",
+        "--color", "never",
+        "-c", f'model_reasoning_effort="{CODEX_REASONING}"',
+        "-o", out_path,
+    ]
+    if CODEX_MODEL:
+        cmd += ["-m", CODEX_MODEL]
+    extra = os.environ.get("CODEX_EXTRA_ARGS", "")
+    if extra:
+        cmd += shlex.split(extra)
+    cmd.append("-")  # read the prompt from stdin
+    try:
+        subprocess.run(
+            cmd,
+            input=prompt.encode(),
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=CODEX_TIMEOUT,
+            check=True,
+        )
+        with open(out_path, "r", errors="replace") as fh:
+            return fh.read().strip()
+    finally:
+        try:
+            os.unlink(out_path)
+        except OSError:
+            pass
+
+
 def llm_call(system: str, user: str) -> str:
+    if LLM_BACKEND == "codex":
+        return _codex_call(system, user)
     if LLM_BACKEND == "bedrock":
         return _bedrock_call(system, user)
     if LLM_BACKEND in ("lm-studio", "lmstudio"):

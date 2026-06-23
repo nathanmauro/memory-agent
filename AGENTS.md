@@ -13,7 +13,7 @@ Pydantic models for validation; otherwise procedural.
 | `src/mcp_memory_agent/server.py` | Entry point: calls `init_db()`, runs `mcp.run()`     |
 | `src/mcp_memory_agent/tools.py` | MCP `FastMCP` app + 14 `@mcp.tool()` functions        |
 | `src/mcp_memory_agent/db.py` | DB config, FTS/query helpers, archive/hot/proposal paths |
-| `src/mcp_memory_agent/llm.py` | LLM dispatch (Ollama / LM Studio / Bedrock), JSON extractors, ranking |
+| `src/mcp_memory_agent/llm.py` | LLM dispatch (Ollama / LM Studio / Bedrock / Codex), JSON extractors, ranking |
 | `src/mcp_memory_agent/hook_handler.py` | CLI entry for client lifecycle hooks (`inject-context`, `record`, `summarize-session`, `finalize-session`, `sweep`, `curator`); always exits 0 |
 | `src/mcp_memory_agent/integrations/` | Claude and Codex installer adapters                |
 | `src/mcp_memory_agent/install.py` | Idempotent installer: `--client claude`, `--client codex`, or `--client both` |
@@ -31,7 +31,7 @@ Transient state:
 
 ## Dependencies
 
-Runtime packages are declared in `pyproject.toml`: `mcp` (MCP Python SDK) and `pydantic`. `boto3` only if using the Bedrock backend. Install manually with:
+Runtime packages are declared in `pyproject.toml`: `mcp` (MCP Python SDK) and `pydantic`. `boto3` only if using the Bedrock backend; the Codex backend requires a working Codex CLI. Install manually with:
 
 ```sh
 pip install "mcp[cli]" pydantic
@@ -66,9 +66,9 @@ Follow PEP 8 conventions manually.
 ## Key Infrastructure
 
 - **Database:** SQLite with FTS5 (optional — degrades gracefully)
-- **LLM:** Ollama (default, `qwen2.5:14b`), LM Studio, or Amazon Bedrock (`us.anthropic.claude-3-5-haiku-20241022-v1:0`) via `LLM_BACKEND` env
-- **Auth:** none for Ollama; AWS credentials via `~/.aws/credentials` or `AWS_PROFILE` for Bedrock
-- **Config:** `MEMORY_AGENT_HOME`, `LLM_BACKEND`, `OLLAMA_URL`, `OLLAMA_MODEL`, `LM_STUDIO_URL`, `LM_STUDIO_MODEL`, `AWS_REGION`, `BEDROCK_MODEL`
+- **LLM:** Ollama (default, `qwen2.5:14b`), LM Studio (`lm-studio` or `lmstudio`), Amazon Bedrock (`us.anthropic.claude-3-5-haiku-20241022-v1:0`), or Codex (`codex exec`) via `LLM_BACKEND` env
+- **Auth:** none for Ollama or LM Studio; AWS credentials via `~/.aws/credentials` or `AWS_PROFILE` for Bedrock; Codex CLI auth for Codex
+- **Config:** `MEMORY_AGENT_HOME`, `LLM_BACKEND`, `OLLAMA_URL`, `OLLAMA_MODEL`, `LM_STUDIO_URL`, `LM_STUDIO_MODEL`, `LM_STUDIO_MAX_TOKENS`, `AWS_REGION`, `BEDROCK_MODEL`, `CODEX_BIN`, `CODEX_MODEL`, `CODEX_REASONING`, `CODEX_TIMEOUT`
 - **MCP tools:** `memory_store`, `memory_query`, `memory_index`, `memory_get`, `memory_pin`, `memory_unpin`, `memory_list`, `memory_timeline`, `memory_forget`, `memory_session_search`, `memory_session_get`, `memory_hot_read`, `memory_hot_edit`, `memory_consolidate`
 
 ## Code Style
@@ -161,7 +161,7 @@ except sqlite3.OperationalError:
 | `models/options.py`  | `MemoryQueryOptions`, `MemoryListOptions`                   |
 | `models/consolidation.py` | `ConsolidationAction`, `ConsolidationResult`           |
 | `db.py`              | `DB_DIR`, `DB_PATH`, `SESSIONS_DIR`, archive/hot/proposal paths, `STOP_WORDS`, all DB helpers, session-buffer/archive iteration |
-| `llm.py`             | `LLM_BACKEND`, Ollama + LM Studio + Bedrock dispatch, `llm_call`, JSON extractors, ranking |
+| `llm.py`             | `LLM_BACKEND`, Ollama + LM Studio + Bedrock + Codex dispatch, `llm_call`, JSON extractors, ranking |
 | `tools.py`           | `mcp` (FastMCP app), all `@mcp.tool()` functions, `_insert_memory`, `_gather_candidates` |
 | `hook_handler.py`    | All client lifecycle handling; reuses `tools._insert_memory` so dedup/merge stays consistent |
 | `server.py`          | Entry point only: `init_db()` + `mcp.run()`                 |

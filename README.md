@@ -32,7 +32,9 @@ The database defaults to `~/.claude/memory/memory.db` (WAL mode). Set `MEMORY_AG
 Backend is selected by `LLM_BACKEND`:
 
 - `ollama` (default) — POSTs to `OLLAMA_URL` (default `http://localhost:11434`) with `OLLAMA_MODEL` (default `qwen2.5:14b`).
+- `lm-studio` / `lmstudio` — POSTs to the OpenAI-compatible `LM_STUDIO_URL` (default `http://localhost:1234`) with `LM_STUDIO_MODEL` (default `qwen3-4b-instruct-2507-mlx`) and `LM_STUDIO_MAX_TOKENS` (default `4096`).
 - `bedrock` — uses `boto3` against `BEDROCK_MODEL` (default `us.anthropic.claude-3-5-haiku-20241022-v1:0`) in `AWS_REGION` (default `us-east-1`), honoring `AWS_PROFILE` if set.
+- `codex` — shells out to non-interactive `codex exec` for cloud summarization. Configure with `CODEX_BIN` (optional explicit binary path), `CODEX_MODEL` (empty uses the Codex CLI default), `CODEX_REASONING` (default `low`), and `CODEX_TIMEOUT` seconds (default `180`).
 
 LLM failures never raise out of `llm.py`; the server falls back to safe defaults. FTS5 is treated as optional too — every FTS read/write is wrapped so the server still runs on SQLite builds without it.
 
@@ -113,7 +115,7 @@ Scope is derived from the session's `cwd`: basename of the nearest `.git` toplev
 # Pure-local validation, mocks the LLM, no network needed
 .venv/bin/python tests/test_validation.py
 
-# Live integration tests; defaults to Ollama, set LLM_BACKEND=bedrock to switch
+# Live integration tests; defaults to Ollama, set LLM_BACKEND to switch
 LLM_BACKEND=ollama OLLAMA_MODEL=gemma4:26b .venv/bin/python tests/test_integration.py
 ```
 
@@ -126,7 +128,7 @@ Small and procedural; `models/` is the only subpackage.
 | `src/mcp_memory_agent/server.py` | Entry point: `db.init_db()` then `mcp.run()`.       |
 | `src/mcp_memory_agent/tools.py` | `FastMCP` app and the fourteen `@mcp.tool()` handlers. |
 | `src/mcp_memory_agent/db.py` | SQLite path/init, FTS upsert/delete, query-term extraction, session-buffer and archive helpers. |
-| `src/mcp_memory_agent/llm.py` | LLM dispatch (Ollama / LM Studio / Bedrock), JSON extraction, ranking. |
+| `src/mcp_memory_agent/llm.py` | LLM dispatch (Ollama / LM Studio / Bedrock / Codex), JSON extraction, ranking. |
 | `src/mcp_memory_agent/hook_handler.py` | CLI entry for hooks: `inject-context`, `record`, `summarize-session`, `finalize-session`, `sweep`, `curator`. |
 | `src/mcp_memory_agent/integrations/` | Claude and Codex installer adapters. |
 | `src/mcp_memory_agent/install.py` | One-shot client installer for Claude, Codex, or both. |

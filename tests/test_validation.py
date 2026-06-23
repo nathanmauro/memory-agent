@@ -5,11 +5,15 @@ Run: python -m tests.test_validation  (or `pytest tests/test_validation.py`)
 
 import json
 import os
+import shlex
 import shutil
+import subprocess
 import tempfile
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 
 from mcp_memory_agent import db, hook_handler, hot, llm, tools
+from mcp_memory_agent.integrations import claude, codex
+from mcp_memory_agent.models import MemoryRecord
 
 PASS = 0
 FAIL = 0
@@ -31,6 +35,16 @@ ORIGINAL_PROPOSALS_DIR = db.PROPOSALS_DIR
 ORIGINAL_BACKUPS_DIR = db.BACKUPS_DIR
 ORIGINAL_CURATOR_LAST_RUN_PATH = db.CURATOR_LAST_RUN_PATH
 ORIGINAL_LLM_CALL = llm.llm_call
+ORIGINAL_LLM_BACKEND = llm.LLM_BACKEND
+ORIGINAL_OLLAMA_CALL = llm._ollama_call
+ORIGINAL_LM_STUDIO_CALL = llm._lm_studio_call
+ORIGINAL_BEDROCK_CALL = llm._bedrock_call
+ORIGINAL_CODEX_CALL = llm._codex_call
+ORIGINAL_CODEX_BIN = llm.CODEX_BIN
+ORIGINAL_CODEX_MODEL = llm.CODEX_MODEL
+ORIGINAL_CODEX_REASONING = llm.CODEX_REASONING
+ORIGINAL_CLAUDE_SETTINGS_PATH = claude.SETTINGS_PATH
+ORIGINAL_CLAUDE_SETTINGS_BACKUP = claude.SETTINGS_BACKUP
 
 
 def ok(name: str) -> None:
@@ -69,7 +83,58 @@ def restore_state() -> None:
     db.BACKUPS_DIR = ORIGINAL_BACKUPS_DIR
     db.CURATOR_LAST_RUN_PATH = ORIGINAL_CURATOR_LAST_RUN_PATH
     llm.llm_call = ORIGINAL_LLM_CALL
+    llm.LLM_BACKEND = ORIGINAL_LLM_BACKEND
+    llm._ollama_call = ORIGINAL_OLLAMA_CALL
+    llm._lm_studio_call = ORIGINAL_LM_STUDIO_CALL
+    llm._bedrock_call = ORIGINAL_BEDROCK_CALL
+    llm._codex_call = ORIGINAL_CODEX_CALL
+    llm.CODEX_BIN = ORIGINAL_CODEX_BIN
+    llm.CODEX_MODEL = ORIGINAL_CODEX_MODEL
+    llm.CODEX_REASONING = ORIGINAL_CODEX_REASONING
+    claude.SETTINGS_PATH = ORIGINAL_CLAUDE_SETTINGS_PATH
+    claude.SETTINGS_BACKUP = ORIGINAL_CLAUDE_SETTINGS_BACKUP
     shutil.rmtree(TEST_ROOT, ignore_errors=True)
+
+
+def assert_result(name: str, condition: bool, reason: str) -> None:
+    if condition:
+        ok(name)
+        return
+    fail(name, reason)
+    assert condition, reason
+
+
+def redirect_claude_settings(root: str) -> None:
+    claude.SETTINGS_PATH = os.path.join(root, ".claude", "settings.json")
+    claude.SETTINGS_BACKUP = claude.SETTINGS_PATH + ".bak"
+
+
+def restore_claude_settings() -> None:
+    claude.SETTINGS_PATH = ORIGINAL_CLAUDE_SETTINGS_PATH
+    claude.SETTINGS_BACKUP = ORIGINAL_CLAUDE_SETTINGS_BACKUP
+
+
+def assert_claude_settings_in_tempdir(root: str) -> None:
+    settings_path = os.path.abspath(claude.SETTINGS_PATH)
+    temp_root = os.path.abspath(root)
+    assert os.path.commonpath([settings_path, temp_root]) == temp_root
+
+
+def snapshot_codex_env() -> dict[str, str | None]:
+    return {key: os.environ.get(key) for key in codex.ENV_KEYS}
+
+
+def clear_codex_env() -> None:
+    for key in codex.ENV_KEYS:
+        os.environ.pop(key, None)
+
+
+def restore_codex_env(snapshot: dict[str, str | None]) -> None:
+    for key, value in snapshot.items():
+        if value is None:
+            os.environ.pop(key, None)
+        else:
+            os.environ[key] = value
 
 
 def insert_memory(
@@ -81,7 +146,7 @@ def insert_memory(
     updated_at: str = "",
     pinned: int = 0,
 ) -> None:
-    now = updated_at or datetime.now(timezone.utc).isoformat()
+    now = updated_at or datetime.now(UTC).isoformat()
     conn = db.get_db()
     conn.execute(
         """
@@ -146,6 +211,544 @@ def test_extract_memory_metadata_normalizes_values() -> None:
         "extract_memory_metadata_normalizes_values",
         f"Unexpected metadata: {meta.model_dump()}",
     )
+
+
+def adjacent_pair(items: list[str], first: str, second: str) -> bool:
+    return any(
+        left == first and right == second
+        for left, right in zip(items, items[1:])
+    )
+
+
+def assert_llm_dispatch(backend: str, expected: str, name: str) -> None:
+    calls = {}
+
+    def make_spy(spy_name: str):
+        def spy(system: str, user: str) -> str:
+            calls[spy_name] = {"system": system, "user": user}
+            return spy_name
+
+        return spy
+
+    llm.llm_call = ORIGINAL_LLM_CALL
+    llm.LLM_BACKEND = backend
+    llm._ollama_call = make_spy("ollama")
+    llm._lm_studio_call = make_spy("lm-studio")
+    llm._bedrock_call = make_spy("bedrock")
+    llm._codex_call = make_spy("codex")
+
+    result = llm.llm_call("sys", "usr")
+    if (
+        result == expected
+        and list(calls.keys()) == [expected]
+        and calls[expected] == {"system": "sys", "user": "usr"}
+    ):
+        ok(name)
+    else:
+        fail(name, f"backend={backend!r} result={result!r} calls={calls!r}")
+
+
+def test_llm_call_dispatches_ollama_backend() -> None:
+    assert_llm_dispatch("ollama", "ollama", "llm_call_dispatches_ollama_backend")
+
+
+def test_llm_call_dispatches_unknown_backend_to_ollama() -> None:
+    assert_llm_dispatch(
+        "bogus", "ollama", "llm_call_dispatches_unknown_backend_to_ollama"
+    )
+
+
+def test_llm_call_dispatches_lm_studio_backend() -> None:
+    assert_llm_dispatch(
+        "lm-studio", "lm-studio", "llm_call_dispatches_lm_studio_backend"
+    )
+
+
+def test_llm_call_dispatches_lmstudio_alias() -> None:
+    assert_llm_dispatch("lmstudio", "lm-studio", "llm_call_dispatches_lmstudio_alias")
+
+
+def test_llm_call_dispatches_bedrock_backend() -> None:
+    assert_llm_dispatch("bedrock", "bedrock", "llm_call_dispatches_bedrock_backend")
+
+
+def test_llm_call_dispatches_codex_backend() -> None:
+    assert_llm_dispatch("codex", "codex", "llm_call_dispatches_codex_backend")
+
+
+def test_extract_json_object_parses_common_llm_shapes() -> None:
+    cases = [
+        (
+            "plain",
+            '{"kind": "decision", "score": 2}',
+            {"kind": "decision", "score": 2},
+        ),
+        ("fenced", '```json\n{"kind": "decision"}\n```', {"kind": "decision"}),
+        (
+            "embedded",
+            'Here is the result:\n{"accepted": true}\nDone.',
+            {"accepted": True},
+        ),
+    ]
+    failures = []
+    for label, raw, expected in cases:
+        result = llm.extract_json_object(raw)
+        if result != expected:
+            failures.append(f"{label}={result!r}")
+
+    if not failures:
+        ok("extract_json_object_parses_common_llm_shapes")
+    else:
+        fail("extract_json_object_parses_common_llm_shapes", "; ".join(failures))
+
+
+def test_extract_json_object_repairs_trailing_commas_and_falls_back() -> None:
+    repaired = llm.extract_json_object('{"name": "alpha", "values": [1, 2,],}')
+    no_braces = llm.extract_json_object("no json here")
+    unrepairable = llm.extract_json_object('{"name": }')
+
+    if (
+        repaired == {"name": "alpha", "values": [1, 2]}
+        and no_braces == {}
+        and unrepairable == {}
+    ):
+        ok("extract_json_object_repairs_trailing_commas_and_falls_back")
+    else:
+        fail(
+            "extract_json_object_repairs_trailing_commas_and_falls_back",
+            f"repaired={repaired!r} no_braces={no_braces!r} unrepairable={unrepairable!r}",
+        )
+
+
+def test_extract_json_array_parses_embedded_and_malformed_inputs() -> None:
+    plain = llm.extract_json_array('[1, {"score": 2}]')
+    embedded = llm.extract_json_array("Ranked indices: [3, 0, 1]\nThanks.")
+    malformed = llm.extract_json_array("[1,]")
+
+    if plain == [1, {"score": 2}] and embedded == [3, 0, 1] and malformed == []:
+        ok("extract_json_array_parses_embedded_and_malformed_inputs")
+    else:
+        fail(
+            "extract_json_array_parses_embedded_and_malformed_inputs",
+            f"plain={plain!r} embedded={embedded!r} malformed={malformed!r}",
+        )
+
+
+def test_strip_fences_handles_tags_and_passthrough() -> None:
+    with_tag = llm._strip_fences('```json\n{"a": 1}\n```')
+    without_tag = llm._strip_fences("```\n[1, 2]\n```")
+    passthrough = llm._strip_fences("no fences")
+
+    if (
+        with_tag == '{"a": 1}'
+        and without_tag == "[1, 2]"
+        and passthrough == "no fences"
+    ):
+        ok("strip_fences_handles_tags_and_passthrough")
+    else:
+        fail(
+            "strip_fences_handles_tags_and_passthrough",
+            f"with_tag={with_tag!r} without_tag={without_tag!r} passthrough={passthrough!r}",
+        )
+
+
+def test_repair_json_removes_trailing_commas() -> None:
+    object_repaired = llm._repair_json('{"a": 1,}')
+    array_repaired = llm._repair_json('{"items": [1, 2,]}')
+
+    if object_repaired == '{"a": 1}' and array_repaired == '{"items": [1, 2]}':
+        ok("repair_json_removes_trailing_commas")
+    else:
+        fail(
+            "repair_json_removes_trailing_commas",
+            f"object={object_repaired!r} array={array_repaired!r}",
+        )
+
+
+def test_resolve_codex_bin_prefers_module_attr_then_path_default() -> None:
+    original_bin = llm.CODEX_BIN
+    try:
+        llm.CODEX_BIN = "/tmp/custom-codex"
+        custom = llm._resolve_codex_bin()
+        llm.CODEX_BIN = ""
+        default = llm._resolve_codex_bin()
+        expected_default = shutil.which("codex") or "/opt/homebrew/bin/codex"
+        if custom == "/tmp/custom-codex" and default == expected_default:
+            ok("resolve_codex_bin_prefers_module_attr_then_path_default")
+        else:
+            fail(
+                "resolve_codex_bin_prefers_module_attr_then_path_default",
+                f"custom={custom!r} default={default!r} expected={expected_default!r}",
+            )
+    finally:
+        llm.CODEX_BIN = original_bin
+
+
+def test_codex_call_builds_offline_argv_and_cleans_output() -> None:
+    original_bin = llm.CODEX_BIN
+    original_codex_call = llm._codex_call
+    original_extra = os.environ.get("CODEX_EXTRA_ARGS")
+    original_model = llm.CODEX_MODEL
+    original_reasoning = llm.CODEX_REASONING
+    original_run = subprocess.run
+    calls = []
+    output_path = ""
+
+    def fake_run(
+        cmd: list[str],
+        input: bytes,
+        stdout: int,
+        stderr: int,
+        timeout: int,
+        check: bool,
+    ) -> subprocess.CompletedProcess:
+        nonlocal output_path
+        calls.append(
+            {
+                "check": check,
+                "cmd": cmd,
+                "input": input,
+                "stderr": stderr,
+                "stdout": stdout,
+                "timeout": timeout,
+            }
+        )
+        output_path = cmd[cmd.index("-o") + 1]
+        with open(output_path, "w") as f:
+            f.write("  offline codex result  \n")
+        return subprocess.CompletedProcess(cmd, 0)
+
+    try:
+        llm.CODEX_BIN = "/tmp/fake-codex"
+        llm._codex_call = ORIGINAL_CODEX_CALL
+        llm.CODEX_MODEL = "gpt-test"
+        llm.CODEX_REASONING = "low"
+        os.environ["CODEX_EXTRA_ARGS"] = '--profile test-profile --flag "two words"'
+        subprocess.run = fake_run
+
+        result = llm._codex_call("system prompt", "user prompt")
+        call = calls[0] if calls else {}
+        cmd = call.get("cmd", [])
+        stdin = call.get("input", b"")
+        out_index = cmd.index("-o") if "-o" in cmd else -1
+        output_unlinked = bool(output_path) and not os.path.exists(output_path)
+        prompt_ok = (
+            b"system prompt" in stdin
+            and b"user prompt" in stdin
+            and b"Output only the requested result" in stdin
+        )
+        required = [
+            "exec",
+            "--ignore-user-config",
+            "--skip-git-repo-check",
+            "--ephemeral",
+        ]
+        argv_ok = all(item in cmd for item in required)
+        pairs_ok = (
+            adjacent_pair(cmd, "-s", "read-only")
+            and adjacent_pair(cmd, "-c", 'model_reasoning_effort="low"')
+            and adjacent_pair(cmd, "-m", "gpt-test")
+        )
+        output_arg_ok = (
+            out_index >= 0
+            and out_index + 1 < len(cmd)
+            and cmd[out_index + 1] == output_path
+        )
+        extra_ok = (
+            "--profile" in cmd
+            and "test-profile" in cmd
+            and "--flag" in cmd
+            and "two words" in cmd
+        )
+
+        if (
+            result == "offline codex result"
+            and argv_ok
+            and pairs_ok
+            and output_arg_ok
+            and extra_ok
+            and prompt_ok
+            and output_unlinked
+        ):
+            ok("codex_call_builds_offline_argv_and_cleans_output")
+        else:
+            fail(
+                "codex_call_builds_offline_argv_and_cleans_output",
+                (
+                    f"result={result!r} cmd={cmd!r} prompt_ok={prompt_ok!r} "
+                    f"output_path={output_path!r} output_unlinked={output_unlinked!r}"
+                ),
+            )
+    finally:
+        llm.CODEX_BIN = original_bin
+        llm._codex_call = original_codex_call
+        llm.CODEX_MODEL = original_model
+        llm.CODEX_REASONING = original_reasoning
+        subprocess.run = original_run
+        if original_extra is None:
+            os.environ.pop("CODEX_EXTRA_ARGS", None)
+        else:
+            os.environ["CODEX_EXTRA_ARGS"] = original_extra
+
+
+def test_claude_load_settings_returns_empty_for_missing_and_bad_json() -> None:
+    name = "claude_load_settings_returns_empty_for_missing_and_bad_json"
+    with tempfile.TemporaryDirectory() as root:
+        try:
+            redirect_claude_settings(root)
+            missing = claude.load_settings()
+
+            os.makedirs(os.path.dirname(claude.SETTINGS_PATH), exist_ok=True)
+            with open(claude.SETTINGS_PATH, "w") as f:
+                f.write("{bad json")
+            corrupt = claude.load_settings()
+
+            with open(claude.SETTINGS_PATH, "w") as f:
+                json.dump(["not", "a", "dict"], f)
+            non_dict = claude.load_settings()
+
+            assert_result(
+                name,
+                missing == {} and corrupt == {} and non_dict == {},
+                f"missing={missing!r} corrupt={corrupt!r} non_dict={non_dict!r}",
+            )
+        finally:
+            restore_claude_settings()
+
+
+def test_claude_entry_has_command_matches_only_list_hooks() -> None:
+    command = "mcp-memory-agent-hook record --kind prompt"
+    matching = {"hooks": [{"type": "command", "command": command}]}
+    non_matching = {"hooks": [{"type": "command", "command": "other"}]}
+    non_list_hooks = {"hooks": {"type": "command", "command": command}}
+
+    assert_result(
+        "claude_entry_has_command_matches_only_list_hooks",
+        claude.entry_has_command(matching, command)
+        and not claude.entry_has_command(non_matching, command)
+        and not claude.entry_has_command(non_list_hooks, command),
+        (
+            f"matching={claude.entry_has_command(matching, command)!r} "
+            f"non_matching={claude.entry_has_command(non_matching, command)!r} "
+            f"non_list={claude.entry_has_command(non_list_hooks, command)!r}"
+        ),
+    )
+
+
+def test_claude_install_hooks_adds_all_events_and_is_idempotent() -> None:
+    name = "claude_install_hooks_adds_all_events_and_is_idempotent"
+    with tempfile.TemporaryDirectory() as root:
+        try:
+            redirect_claude_settings(root)
+            assert_claude_settings_in_tempdir(root)
+            added = claude.install_hooks()
+            assert_claude_settings_in_tempdir(root)
+            second_added = claude.install_hooks()
+
+            with open(claude.SETTINGS_PATH) as f:
+                settings = json.load(f)
+            hooks = settings.get("hooks", {})
+            expected = {
+                event: [claude.hook_command(args) for args in arg_lists]
+                for event, arg_lists in claude.HOOK_EVENTS.items()
+            }
+            actual = {
+                event: [
+                    entry["hooks"][0]["command"]
+                    for entry in hooks.get(event, [])
+                    if isinstance(entry, dict) and entry.get("hooks")
+                ]
+                for event in claude.HOOK_EVENTS
+            }
+
+            assert_result(
+                name,
+                added == 5
+                and second_added == 0
+                and set(claude.HOOK_EVENTS).issubset(hooks)
+                and len(hooks.get("SessionStart", [])) == 2
+                and actual == expected,
+                (
+                    f"added={added} second={second_added} "
+                    f"events={list(hooks.keys())!r} actual={actual!r} expected={expected!r}"
+                ),
+            )
+        finally:
+            restore_claude_settings()
+
+
+def test_claude_backup_settings_copies_existing_settings() -> None:
+    name = "claude_backup_settings_copies_existing_settings"
+    with tempfile.TemporaryDirectory() as root:
+        try:
+            redirect_claude_settings(root)
+            os.makedirs(os.path.dirname(claude.SETTINGS_PATH), exist_ok=True)
+            with open(claude.SETTINGS_PATH, "w") as f:
+                json.dump({"hooks": {"Existing": []}}, f)
+
+            assert_claude_settings_in_tempdir(root)
+            claude.backup_settings()
+
+            with open(claude.SETTINGS_BACKUP) as f:
+                backup = json.load(f)
+            assert_result(
+                name,
+                backup == {"hooks": {"Existing": []}},
+                f"backup={backup!r} path={claude.SETTINGS_BACKUP!r}",
+            )
+        finally:
+            restore_claude_settings()
+
+
+def test_codex_load_hooks_returns_default_for_missing_and_bad_shapes() -> None:
+    name = "codex_load_hooks_returns_default_for_missing_and_bad_shapes"
+    with tempfile.TemporaryDirectory() as root:
+        path = os.path.join(root, ".codex", "hooks.json")
+        missing = codex.load_hooks(path)
+
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w") as f:
+            f.write("{bad json")
+        corrupt = codex.load_hooks(path)
+
+        with open(path, "w") as f:
+            json.dump(["not", "a", "dict"], f)
+        non_dict = codex.load_hooks(path)
+
+        with open(path, "w") as f:
+            json.dump({"hooks": ["bad"], "keep": True}, f)
+        bad_hooks = codex.load_hooks(path)
+
+        assert_result(
+            name,
+            missing == {"hooks": {}}
+            and corrupt == {"hooks": {}}
+            and non_dict == {"hooks": {}}
+            and bad_hooks == {"hooks": {}, "keep": True},
+            (
+                f"missing={missing!r} corrupt={corrupt!r} "
+                f"non_dict={non_dict!r} bad_hooks={bad_hooks!r}"
+            ),
+        )
+
+
+def test_codex_install_hooks_writes_all_events_and_is_idempotent() -> None:
+    name = "codex_install_hooks_writes_all_events_and_is_idempotent"
+    env_snapshot = snapshot_codex_env()
+    with tempfile.TemporaryDirectory() as root:
+        try:
+            clear_codex_env()
+            added = codex.install_hooks(root)
+            second_added = codex.install_hooks(root)
+            path = codex.hook_path(root)
+
+            with open(path) as f:
+                data = json.load(f)
+            hooks = data.get("hooks", {})
+            expected = {
+                event: [
+                    (spec.get("matcher", ""), codex.hook_command(spec["args"]))
+                    for spec in specs
+                ]
+                for event, specs in codex.HOOK_EVENTS.items()
+            }
+            actual = {
+                event: [
+                    (entry.get("matcher", ""), entry["hooks"][0]["command"])
+                    for entry in hooks.get(event, [])
+                    if isinstance(entry, dict) and entry.get("hooks")
+                ]
+                for event in codex.HOOK_EVENTS
+            }
+            expected_added = sum(len(entries) for entries in codex.HOOK_EVENTS.values())
+
+            assert_result(
+                name,
+                added == expected_added
+                and second_added == 0
+                and os.path.exists(path)
+                and actual == expected,
+                (
+                    f"added={added} expected_added={expected_added} "
+                    f"second={second_added} actual={actual!r} expected={expected!r}"
+                ),
+            )
+        finally:
+            restore_codex_env(env_snapshot)
+
+
+def test_codex_env_helpers_include_only_set_keys_and_quote_commands() -> None:
+    name = "codex_env_helpers_include_only_set_keys_and_quote_commands"
+    env_snapshot = snapshot_codex_env()
+    expected_env = "LLM_BACKEND=lm studio's test"
+    try:
+        clear_codex_env()
+        os.environ["LLM_BACKEND"] = "lm studio's test"
+        env_args = codex.mcp_env_args()
+        prefix = codex.hook_env_command_prefix()
+        command = codex.hook_command(["record", "--kind", "prompt value"])
+        split_command = shlex.split(command)
+
+        assert_result(
+            name,
+            env_args == ["--env", expected_env]
+            and prefix == ["env", expected_env]
+            and expected_env in split_command
+            and split_command[-3:] == ["record", "--kind", "prompt value"]
+            and shlex.quote(expected_env) in command
+            and shlex.quote("prompt value") in command,
+            (
+                f"env_args={env_args!r} prefix={prefix!r} "
+                f"command={command!r} split={split_command!r}"
+            ),
+        )
+    finally:
+        restore_codex_env(env_snapshot)
+
+
+def test_codex_hook_command_quotes_shell_sensitive_args() -> None:
+    name = "codex_hook_command_quotes_shell_sensitive_args"
+    env_snapshot = snapshot_codex_env()
+    try:
+        clear_codex_env()
+        command = codex.hook_command(["record", "--kind", "prompt value", "semi;colon"])
+        split_command = shlex.split(command)
+        assert_result(
+            name,
+            split_command[-4:] == ["record", "--kind", "prompt value", "semi;colon"]
+            and shlex.quote("prompt value") in command
+            and shlex.quote("semi;colon") in command,
+            f"command={command!r} split={split_command!r}",
+        )
+    finally:
+        restore_codex_env(env_snapshot)
+
+
+def test_llm_safe_fallbacks_when_llm_call_raises() -> None:
+    def raising_llm_call(system: str, user: str) -> str:
+        raise RuntimeError("offline failure")
+
+    llm.llm_call = raising_llm_call
+    metadata = llm.extract_memory_metadata("remember the fallback", "global", [])
+    candidates = [
+        MemoryRecord(id="mem-1", content="first memory", importance=5),
+        MemoryRecord(id="mem-2", content="second memory", importance=4),
+        MemoryRecord(id="mem-3", content="third memory", importance=3),
+    ]
+    ranked = llm.rank_memories("memory", candidates, 2)
+
+    if (
+        metadata.category == "project_knowledge"
+        and metadata.importance == 3
+        and metadata.tags == ""
+        and ranked == candidates[:2]
+    ):
+        ok("llm_safe_fallbacks_when_llm_call_raises")
+    else:
+        fail(
+            "llm_safe_fallbacks_when_llm_call_raises",
+            f"metadata={metadata.model_dump()} ranked={ranked!r}",
+        )
 
 
 def test_memory_query_clamps_limit() -> None:
@@ -311,7 +914,7 @@ def test_memory_get_full_and_prefix() -> None:
 
 def test_memory_timeline_orders_and_filters() -> None:
     reset_db()
-    base = datetime(2026, 5, 1, tzinfo=timezone.utc)
+    base = datetime(2026, 5, 1, tzinfo=UTC)
     for idx in range(3):
         ts = (base + timedelta(days=idx)).isoformat()
         insert_memory(
@@ -352,8 +955,8 @@ def test_memory_timeline_orders_and_filters() -> None:
 
 def test_memory_list_and_timeline_exclude_stale_by_default() -> None:
     reset_db()
-    active_ts = datetime(2026, 5, 1, tzinfo=timezone.utc).isoformat()
-    stale_ts = datetime(2026, 5, 2, tzinfo=timezone.utc).isoformat()
+    active_ts = datetime(2026, 5, 1, tzinfo=UTC).isoformat()
+    stale_ts = datetime(2026, 5, 2, tzinfo=UTC).isoformat()
     insert_memory(
         "61616161-6161-6161-6161-616161616161",
         "status filter active row",
@@ -396,13 +999,372 @@ def test_memory_list_and_timeline_exclude_stale_by_default() -> None:
         )
 
 
+def test_hook_derive_scope_uses_git_root_or_path_basename() -> None:
+    with tempfile.TemporaryDirectory() as root:
+        repo = os.path.abspath(os.path.join(root, "repo-alpha"))
+        nested = os.path.join(repo, "nested", "child")
+        no_git = os.path.abspath(os.path.join(root, "plain-leaf"))
+        os.makedirs(os.path.join(repo, ".git"), exist_ok=True)
+        os.makedirs(nested, exist_ok=True)
+        os.makedirs(no_git, exist_ok=True)
+
+        git_scope = hook_handler._derive_scope(nested)
+        path_scope = hook_handler._derive_scope(no_git)
+        empty_scope = hook_handler._derive_scope("")
+        non_string_scope = hook_handler._derive_scope(123)
+
+        assert_result(
+            "hook_derive_scope_uses_git_root_or_path_basename",
+            git_scope == "repo-alpha"
+            and path_scope == "plain-leaf"
+            and empty_scope == "global"
+            and non_string_scope == "global",
+            (
+                f"git={git_scope!r} path={path_scope!r} empty={empty_scope!r} "
+                f"non_string={non_string_scope!r}"
+            ),
+        )
+
+
+def test_hook_payload_value_respects_precedence_and_defaults() -> None:
+    payload = {
+        "first": "",
+        "second": None,
+        "third": "selected",
+        "fourth": "ignored",
+    }
+    selected = hook_handler._payload_value(payload, ["first", "second", "third"])
+    early = hook_handler._payload_value(payload, ["fourth", "third"])
+    missing = hook_handler._payload_value(payload, ["missing", "first"], "fallback")
+
+    assert_result(
+        "hook_payload_value_respects_precedence_and_defaults",
+        selected == "selected" and early == "ignored" and missing == "fallback",
+        f"selected={selected!r} early={early!r} missing={missing!r}",
+    )
+
+
+def test_hook_payload_cwd_aliases_and_pwd_fallback() -> None:
+    original_pwd = os.environ.get("PWD")
+    try:
+        os.environ["PWD"] = "/tmp/pwd-fallback"
+        aliases = [
+            ("cwd", "/tmp/cwd"),
+            ("workdir", "/tmp/workdir"),
+            ("working_dir", "/tmp/working-dir"),
+            ("workingDirectory", "/tmp/working-directory"),
+        ]
+        alias_results = [
+            hook_handler._payload_cwd({key: value})
+            for key, value in aliases
+        ]
+        precedence = hook_handler._payload_cwd(
+            {"cwd": "", "workdir": "/tmp/workdir-selected"}
+        )
+        fallback = hook_handler._payload_cwd({})
+
+        assert_result(
+            "hook_payload_cwd_aliases_and_pwd_fallback",
+            alias_results
+            == [
+                "/tmp/cwd",
+                "/tmp/workdir",
+                "/tmp/working-dir",
+                "/tmp/working-directory",
+            ]
+            and precedence == "/tmp/workdir-selected"
+            and fallback == "/tmp/pwd-fallback",
+            (
+                f"aliases={alias_results!r} precedence={precedence!r} "
+                f"fallback={fallback!r}"
+            ),
+        )
+    finally:
+        if original_pwd is None:
+            os.environ.pop("PWD", None)
+        else:
+            os.environ["PWD"] = original_pwd
+
+
+def test_hook_payload_session_id_aliases_and_env_fallback() -> None:
+    env_keys = [
+        "MEMORY_AGENT_SESSION_ID",
+        "CLAUDE_SESSION_ID",
+        "CODEX_SESSION_ID",
+    ]
+    original_env = {key: os.environ.get(key) for key in env_keys}
+    try:
+        for key in env_keys:
+            os.environ.pop(key, None)
+
+        aliases = [
+            ("session_id", "session-a"),
+            ("sessionId", "session-b"),
+            ("conversation_id", "conversation-a"),
+            ("conversationId", "conversation-b"),
+            ("thread_id", "thread-a"),
+            ("threadId", "thread-b"),
+        ]
+        alias_results = [
+            hook_handler._payload_session_id({key: value})
+            for key, value in aliases
+        ]
+        no_fallback = hook_handler._payload_session_id({})
+
+        os.environ["MEMORY_AGENT_SESSION_ID"] = "memory-env"
+        os.environ["CLAUDE_SESSION_ID"] = "claude-env"
+        os.environ["CODEX_SESSION_ID"] = "codex-env"
+        env_fallback = hook_handler._payload_session_id({})
+
+        assert_result(
+            "hook_payload_session_id_aliases_and_env_fallback",
+            alias_results
+            == [
+                "session-a",
+                "session-b",
+                "conversation-a",
+                "conversation-b",
+                "thread-a",
+                "thread-b",
+            ]
+            and no_fallback == ""
+            and env_fallback == "memory-env",
+            (
+                f"aliases={alias_results!r} no_fallback={no_fallback!r} "
+                f"env_fallback={env_fallback!r}"
+            ),
+        )
+    finally:
+        for key, value in original_env.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+
+
+def test_hook_truncate_limits_strings_dicts_and_lists() -> None:
+    long_string = hook_handler._truncate("abcdef", limit=3)
+    unchanged_string = hook_handler._truncate("abc", limit=3)
+    truncated_dict = hook_handler._truncate(
+        {f"k{idx}": "abcdef" for idx in range(25)}, limit=2
+    )
+    truncated_list = hook_handler._truncate(["abcdef" for _ in range(25)], limit=2)
+    passthrough = hook_handler._truncate(42, limit=2)
+
+    assert_result(
+        "hook_truncate_limits_strings_dicts_and_lists",
+        long_string == "abc" + "\u2026"
+        and unchanged_string == "abc"
+        and isinstance(truncated_dict, dict)
+        and list(truncated_dict) == [f"k{idx}" for idx in range(20)]
+        and set(truncated_dict.values()) == {"ab" + "\u2026"}
+        and truncated_list == ["ab" + "\u2026" for _ in range(20)]
+        and passthrough == 42,
+        (
+            f"long={long_string!r} unchanged={unchanged_string!r} "
+            f"dict_len={len(truncated_dict) if isinstance(truncated_dict, dict) else None} "
+            f"list_len={len(truncated_list) if isinstance(truncated_list, list) else None} "
+            f"passthrough={passthrough!r}"
+        ),
+    )
+
+
+def test_hook_session_path_sanitizes_ids_under_sessions_dir() -> None:
+    original_sessions_dir = db.SESSIONS_DIR
+    with tempfile.TemporaryDirectory() as root:
+        try:
+            db.SESSIONS_DIR = os.path.join(root, "sessions")
+            path = hook_handler._session_path("ab c/!D-_")
+            non_string = hook_handler._session_path(123)
+            empty_safe = hook_handler._session_path(" !/")
+
+            assert_result(
+                "hook_session_path_sanitizes_ids_under_sessions_dir",
+                path == os.path.join(db.SESSIONS_DIR, "abcD-_.jsonl")
+                and os.path.commonpath([path, db.SESSIONS_DIR]) == db.SESSIONS_DIR
+                and non_string is None
+                and empty_safe is None,
+                f"path={path!r} non_string={non_string!r} empty={empty_safe!r}",
+            )
+        finally:
+            db.SESSIONS_DIR = original_sessions_dir
+
+
+def test_hook_append_event_writes_prompt_and_tool_use_only() -> None:
+    original_sessions_dir = db.SESSIONS_DIR
+    with tempfile.TemporaryDirectory() as root:
+        try:
+            db.SESSIONS_DIR = os.path.join(root, "sessions")
+            repo = os.path.join(root, "repo-scope")
+            nested = os.path.join(repo, "nested")
+            os.makedirs(os.path.join(repo, ".git"), exist_ok=True)
+            os.makedirs(nested, exist_ok=True)
+
+            hook_handler._append_event(
+                {
+                    "session_id": "prompt session!/1",
+                    "cwd": nested,
+                    "prompt": "remember this",
+                },
+                "prompt",
+            )
+            prompt_path = os.path.join(db.SESSIONS_DIR, "promptsession1.jsonl")
+            with open(prompt_path) as f:
+                prompt_lines = f.readlines()
+            prompt_event = json.loads(prompt_lines[0])
+
+            hook_handler._append_event(
+                {
+                    "session_id": "tool-session_2",
+                    "cwd": nested,
+                    "tool_name": "Bash",
+                    "tool_input": {"cmd": "pwd"},
+                    "tool_response": {"stdout": nested},
+                },
+                "tool_use",
+            )
+            tool_path = os.path.join(db.SESSIONS_DIR, "tool-session_2.jsonl")
+            with open(tool_path) as f:
+                tool_lines = f.readlines()
+            tool_event = json.loads(tool_lines[0])
+
+            hook_handler._append_event(
+                {
+                    "session_id": "unknown !/session",
+                    "cwd": nested,
+                    "prompt": "do not write",
+                },
+                "unknown",
+            )
+            unknown_path = os.path.join(db.SESSIONS_DIR, "unknownsession.jsonl")
+
+            assert_result(
+                "hook_append_event_writes_prompt_and_tool_use_only",
+                len(prompt_lines) == 1
+                and prompt_event["kind"] == "prompt"
+                and prompt_event["scope"] == "repo-scope"
+                and prompt_event["data"] == {"prompt": "remember this"}
+                and len(tool_lines) == 1
+                and tool_event["kind"] == "tool_use"
+                and tool_event["scope"] == "repo-scope"
+                and tool_event["data"]["tool_name"] == "Bash"
+                and tool_event["data"]["tool_input"] == {"cmd": "pwd"}
+                and not os.path.exists(unknown_path),
+                (
+                    f"prompt_lines={len(prompt_lines)} prompt={prompt_event!r} "
+                    f"tool_lines={len(tool_lines)} tool={tool_event!r} "
+                    f"unknown_exists={os.path.exists(unknown_path)!r}"
+                ),
+            )
+        finally:
+            db.SESSIONS_DIR = original_sessions_dir
+
+
+def test_hook_read_buffer_skips_invalid_lines_and_missing_files() -> None:
+    with tempfile.TemporaryDirectory() as root:
+        path = os.path.join(root, "buffer.jsonl")
+        with open(path, "w") as f:
+            f.write(json.dumps({"kind": "prompt"}) + "\n")
+            f.write("\n")
+            f.write("not json\n")
+            f.write(json.dumps(["not", "a", "dict"]) + "\n")
+            f.write(json.dumps({"kind": "tool_use"}) + "\n")
+
+        events = hook_handler._read_buffer(path)
+        missing = hook_handler._read_buffer(os.path.join(root, "missing.jsonl"))
+
+        assert_result(
+            "hook_read_buffer_skips_invalid_lines_and_missing_files",
+            events == [{"kind": "prompt"}, {"kind": "tool_use"}] and missing == [],
+            f"events={events!r} missing={missing!r}",
+        )
+
+
+def test_hook_remove_buffer_deletes_existing_and_ignores_missing() -> None:
+    with tempfile.TemporaryDirectory() as root:
+        path = os.path.join(root, "buffer.jsonl")
+        with open(path, "w") as f:
+            f.write("event\n")
+
+        hook_handler._remove_buffer(path)
+        removed = not os.path.exists(path)
+        hook_handler._remove_buffer(path)
+
+        assert_result(
+            "hook_remove_buffer_deletes_existing_and_ignores_missing",
+            removed and not os.path.exists(path),
+            f"removed={removed!r} exists={os.path.exists(path)!r}",
+        )
+
+
+def test_hook_build_transcript_formats_limits_and_caps_events() -> None:
+    events = [
+        {"kind": "prompt", "data": {"prompt": "first"}},
+        {"kind": "tool_use", "data": {"tool_name": "Bash", "tool_input": {"cmd": "pwd"}}},
+        {"kind": "note", "data": {"detail": "ignored"}},
+    ]
+    transcript = hook_handler._build_transcript(events, max_chars=200)
+    limited = hook_handler._build_transcript(events, max_chars=12)
+    many_events = [
+        {"kind": "prompt", "data": {"prompt": f"event-{idx}"}}
+        for idx in range(201)
+    ]
+    capped = hook_handler._build_transcript(many_events, max_chars=10000)
+
+    assert_result(
+        "hook_build_transcript_formats_limits_and_caps_events",
+        transcript == 'USER: first\nTOOL Bash: {"cmd": "pwd"}'
+        and limited == "USER: first"
+        and "event-199" in capped
+        and "event-200" not in capped,
+        (
+            f"transcript={transcript!r} limited={limited!r} "
+            f"contains199={'event-199' in capped} contains200={'event-200' in capped}"
+        ),
+    )
+
+
+def test_hook_parse_string_list_filters_and_caps_items() -> None:
+    non_list = hook_handler._parse_string_list("not-a-list")
+    parsed = hook_handler._parse_string_list(
+        [None, "", " alpha ", "beta", " ", "gamma", "delta"]
+    )
+
+    assert_result(
+        "hook_parse_string_list_filters_and_caps_items",
+        non_list == [] and parsed == ["alpha", "beta", "gamma"],
+        f"non_list={non_list!r} parsed={parsed!r}",
+    )
+
+
+def test_hook_parse_memory_item_accepts_strings_and_dicts() -> None:
+    from_string = hook_handler._parse_memory_item("  remember me  ")
+    from_dict = hook_handler._parse_memory_item(
+        {"content": "  stored content  ", "tags": "  one,two  "}
+    )
+    bad_dict = hook_handler._parse_memory_item({"content": 123, "tags": ["one"]})
+    junk = hook_handler._parse_memory_item(["not", "valid"])
+
+    assert_result(
+        "hook_parse_memory_item_accepts_strings_and_dicts",
+        from_string == ("remember me", "")
+        and from_dict == ("stored content", "one,two")
+        and bad_dict == ("", "")
+        and junk == ("", ""),
+        (
+            f"string={from_string!r} dict={from_dict!r} "
+            f"bad_dict={bad_dict!r} junk={junk!r}"
+        ),
+    )
+
+
 def _write_summarize_buffer(session_id: str, event_count: int = 4) -> str:
     buffer_path = os.path.join(db.SESSIONS_DIR, f"{session_id}.jsonl")
     os.makedirs(db.SESSIONS_DIR, exist_ok=True)
     with open(buffer_path, "w") as f:
         for i in range(event_count):
             event = {
-                "ts": datetime.now(timezone.utc).isoformat(),
+                "ts": datetime.now(UTC).isoformat(),
                 "kind": "prompt" if i % 2 == 0 else "tool_use",
                 "scope": "__validation__",
                 "data": {"prompt": f"do thing {i}"}
@@ -666,8 +1628,8 @@ def test_inject_includes_hot_memory() -> None:
     marker = "unique-hot-marker-xyzzy"
     tools.memory_hot_edit(scope, "replace", marker, target="")
 
-    import io
     import contextlib
+    import io
 
     payload = {"cwd": os.path.join(TEST_ROOT, scope)}
     buf = io.StringIO()
@@ -698,8 +1660,8 @@ def test_inject_excludes_unpinned_warm_memory_by_default() -> None:
         importance=5,
     )
 
-    import io
     import contextlib
+    import io
 
     payload = {"cwd": os.path.join(TEST_ROOT, scope)}
     buf = io.StringIO()
@@ -734,8 +1696,8 @@ def test_inject_includes_pinned_warm_memory() -> None:
         pinned=1,
     )
 
-    import io
     import contextlib
+    import io
 
     payload = {"cwd": os.path.join(TEST_ROOT, scope)}
     buf = io.StringIO()
@@ -770,8 +1732,8 @@ def test_memory_pin_enables_startup_inject() -> None:
         fail("memory_pin_enables_startup_inject", f"missing memory_pin: {exc}")
         return
 
-    import io
     import contextlib
+    import io
 
     payload = {"cwd": os.path.join(TEST_ROOT, scope)}
     buf = io.StringIO()
@@ -808,8 +1770,8 @@ def test_memory_unpin_disables_startup_inject() -> None:
         fail("memory_unpin_disables_startup_inject", f"missing memory_unpin: {exc}")
         return
 
-    import io
     import contextlib
+    import io
 
     payload = {"cwd": os.path.join(TEST_ROOT, scope)}
     buf = io.StringIO()
@@ -842,8 +1804,8 @@ def test_large_hot_memory_does_not_crowd_out_pinned_warm_memory() -> None:
         pinned=1,
     )
 
-    import io
     import contextlib
+    import io
 
     payload = {"cwd": os.path.join(TEST_ROOT, scope)}
     buf = io.StringIO()
@@ -877,7 +1839,7 @@ def test_inject_excludes_archive_pointers_by_default() -> None:
         f.write(
             json.dumps(
                 {
-                    "ts": datetime.now(timezone.utc).isoformat(),
+                    "ts": datetime.now(UTC).isoformat(),
                     "kind": "prompt",
                     "scope": scope,
                     "data": {"prompt": marker},
@@ -890,15 +1852,15 @@ def test_inject_excludes_archive_pointers_by_default() -> None:
         conn,
         session_id,
         scope,
-        datetime.now(timezone.utc).isoformat(),
+        datetime.now(UTC).isoformat(),
         archive_path,
         db.build_archive_index_text(archive_path),
     )
     conn.commit()
     conn.close()
 
-    import io
     import contextlib
+    import io
 
     payload = {"cwd": os.path.join(TEST_ROOT, scope)}
     buf = io.StringIO()
@@ -957,7 +1919,7 @@ def test_memory_consolidate_dry_run_by_default() -> None:
 
 def test_curator_skips_within_interval() -> None:
     reset_db()
-    db.write_curator_last_run(datetime.now(timezone.utc).isoformat())
+    db.write_curator_last_run(datetime.now(UTC).isoformat())
     calls = {"count": 0}
     llm.llm_call = lambda s, u: (calls.update(count=calls["count"] + 1) or "{}")
 
@@ -971,7 +1933,7 @@ def test_curator_skips_within_interval() -> None:
 
 def test_curator_runs_lifecycle_and_proposal() -> None:
     reset_db()
-    old = (datetime.now(timezone.utc) - timedelta(days=40)).isoformat()
+    old = (datetime.now(UTC) - timedelta(days=40)).isoformat()
     conn = db.get_db()
     conn.execute(
         """
@@ -1025,7 +1987,7 @@ def test_curator_runs_lifecycle_and_proposal() -> None:
 
 def test_lifecycle_stales_old_high_importance_unpinned_memory() -> None:
     reset_db()
-    old = (datetime.now(timezone.utc) - timedelta(days=40)).isoformat()
+    old = (datetime.now(UTC) - timedelta(days=40)).isoformat()
     insert_memory(
         "98989898-9898-9898-9898-989898989898",
         "old high importance unpinned memory",
@@ -1061,7 +2023,7 @@ def test_memory_session_get_returns_transcript() -> None:
         f.write(
             json.dumps(
                 {
-                    "ts": datetime.now(timezone.utc).isoformat(),
+                    "ts": datetime.now(UTC).isoformat(),
                     "kind": "prompt",
                     "scope": "__validation__",
                     "data": {"prompt": prompt_text},
@@ -1074,7 +2036,7 @@ def test_memory_session_get_returns_transcript() -> None:
         conn,
         session_id,
         "__validation__",
-        datetime.now(timezone.utc).isoformat(),
+        datetime.now(UTC).isoformat(),
         archive_path,
         db.build_archive_index_text(archive_path),
     )
@@ -1100,7 +2062,7 @@ def test_memory_session_get_returns_transcript() -> None:
 
 def test_memory_session_get_uses_scope_for_ambiguous_prefix() -> None:
     reset_db()
-    now = datetime.now(timezone.utc).isoformat()
+    now = datetime.now(UTC).isoformat()
     sessions = [
         ("ambiguous-session-alpha", "scope-one", "alpha prompt marker"),
         ("ambiguous-session-beta", "scope-two", "beta prompt marker"),
@@ -1159,7 +2121,7 @@ def test_memory_session_search_finds_archived_content() -> None:
         f.write(
             json.dumps(
                 {
-                    "ts": datetime.now(timezone.utc).isoformat(),
+                    "ts": datetime.now(UTC).isoformat(),
                     "kind": "prompt",
                     "scope": "__validation__",
                     "data": {"prompt": "unique glacier keyword xyzzy"},
@@ -1172,7 +2134,7 @@ def test_memory_session_search_finds_archived_content() -> None:
         conn,
         session_id,
         "__validation__",
-        datetime.now(timezone.utc).isoformat(),
+        datetime.now(UTC).isoformat(),
         archive_path,
         db.build_archive_index_text(archive_path),
     )
@@ -1186,10 +2148,323 @@ def test_memory_session_search_finds_archived_content() -> None:
         fail("memory_session_search_finds_archived_content", result)
 
 
+def test_extract_search_terms_filters_and_limits() -> None:
+    reset_db()
+    query = "the ai c++ memory? and db go pipe|danger alpha beta gamma aftercap"
+    terms = db.extract_search_terms(query, 10)
+    limited = db.extract_search_terms(query, 2)
+    unsafe_chars = set("+-:\"*()|?")
+
+    if (
+        terms == ["memory", "pipedanger", "alpha", "beta"]
+        and limited == ["memory", "pipedanger"]
+        and all(not unsafe_chars.intersection(term) for term in terms)
+    ):
+        ok("extract_search_terms_filters_and_limits")
+    else:
+        fail(
+            "extract_search_terms_filters_and_limits",
+            f"terms={terms} limited={limited}",
+        )
+
+
+def test_build_memory_filters_composes_conditions() -> None:
+    reset_db()
+    empty = db.build_memory_filters()
+    filtered = db.build_memory_filters(
+        scope="__validation__",
+        category="project_knowledge",
+        status="stale",
+    )
+    aliased = db.build_memory_filters(scope="global", alias="m", status="active")
+
+    if (
+        empty == ([], [])
+        and filtered
+        == (
+            ["scope = ?", "category = ?", "status = ?"],
+            ["__validation__", "project_knowledge", "stale"],
+        )
+        and aliased == (["m.scope = ?", "m.status = ?"], ["global", "active"])
+    ):
+        ok("build_memory_filters_composes_conditions")
+    else:
+        fail(
+            "build_memory_filters_composes_conditions",
+            f"empty={empty} filtered={filtered} aliased={aliased}",
+        )
+
+
+def test_format_archive_event_outputs_expected_text() -> None:
+    reset_db()
+    ts = "2026-06-22T12:34:56+00:00"
+    prompt = db.format_archive_event(
+        {"ts": ts, "kind": "prompt", "data": {"prompt": "hello memory"}}
+    )
+    tool = db.format_archive_event(
+        {
+            "ts": ts,
+            "kind": "tool_use",
+            "data": {
+                "tool_name": "Read",
+                "tool_input": {"path": "AGENTS.md"},
+                "tool_response": {},
+            },
+        }
+    )
+    generic = db.format_archive_event(
+        {"ts": ts, "kind": "note", "data": {"detail": "done"}}
+    )
+
+    if (
+        prompt == "[2026-06-22T12:34:56] USER: hello memory"
+        and tool == '[2026-06-22T12:34:56] TOOL Read: {"path": "AGENTS.md"}'
+        and generic == '[2026-06-22T12:34:56] note: {"detail": "done"}'
+    ):
+        ok("format_archive_event_outputs_expected_text")
+    else:
+        fail(
+            "format_archive_event_outputs_expected_text",
+            f"prompt={prompt!r} tool={tool!r} generic={generic!r}",
+        )
+
+
+def test_flatten_archive_line_outputs_index_text() -> None:
+    reset_db()
+    prompt = db.flatten_archive_line(
+        json.dumps({"kind": "prompt", "data": {"prompt": "hello memory"}})
+    )
+    tool = db.flatten_archive_line(
+        json.dumps(
+            {
+                "kind": "tool_use",
+                "data": {
+                    "tool_name": "Bash",
+                    "tool_input": {"cmd": "git status"},
+                    "tool_response": {"stdout": "clean"},
+                },
+            }
+        )
+    )
+    passthrough = db.flatten_archive_line("not json at all")
+
+    if (
+        prompt == "prompt hello memory"
+        and tool == 'tool_use Bash {"cmd": "git status"} {"stdout": "clean"}'
+        and passthrough == "not json at all"
+    ):
+        ok("flatten_archive_line_outputs_index_text")
+    else:
+        fail(
+            "flatten_archive_line_outputs_index_text",
+            f"prompt={prompt!r} tool={tool!r} passthrough={passthrough!r}",
+        )
+
+
+def test_build_archive_index_text_flattens_file() -> None:
+    reset_db()
+    archive_path = db.archive_session_path("__validation__", "index-text-001")
+    os.makedirs(os.path.dirname(archive_path), exist_ok=True)
+    with open(archive_path, "w") as f:
+        f.write(
+            json.dumps({"kind": "prompt", "data": {"prompt": "index alpha"}})
+            + "\n"
+        )
+        f.write("\n")
+        f.write(
+            json.dumps(
+                {
+                    "kind": "tool_use",
+                    "data": {"tool_name": "Bash", "tool_input": {"cmd": "pwd"}},
+                }
+            )
+            + "\n"
+        )
+        f.write("plain transcript line\n")
+
+    text = db.build_archive_index_text(archive_path)
+    expected = "\n".join(
+        [
+            "prompt index alpha",
+            'tool_use Bash {"cmd": "pwd"}',
+            "plain transcript line",
+        ]
+    )
+
+    if text == expected:
+        ok("build_archive_index_text_flattens_file")
+    else:
+        fail("build_archive_index_text_flattens_file", text)
+
+
+def test_read_archive_transcript_limits_and_missing() -> None:
+    reset_db()
+    ts = "2026-06-22T12:34:56+00:00"
+    archive_path = db.archive_session_path("__validation__", "read-limit-001")
+    os.makedirs(os.path.dirname(archive_path), exist_ok=True)
+    with open(archive_path, "w") as f:
+        f.write(
+            json.dumps(
+                {"ts": ts, "kind": "prompt", "data": {"prompt": "first prompt"}}
+            )
+            + "\n"
+        )
+        f.write(
+            json.dumps(
+                {"ts": ts, "kind": "note", "data": {"detail": "second event"}}
+            )
+            + "\n"
+        )
+        f.write(
+            json.dumps(
+                {"ts": ts, "kind": "prompt", "data": {"prompt": "third prompt"}}
+            )
+            + "\n"
+        )
+
+    transcript = db.read_archive_transcript(archive_path, limit=2)
+    missing = db.read_archive_transcript(os.path.join(TEST_ROOT, "missing.jsonl"))
+    expected = "\n".join(
+        [
+            "[2026-06-22T12:34:56] USER: first prompt",
+            '[2026-06-22T12:34:56] note: {"detail": "second event"}',
+        ]
+    )
+
+    if transcript == expected and missing == "":
+        ok("read_archive_transcript_limits_and_missing")
+    else:
+        fail(
+            "read_archive_transcript_limits_and_missing",
+            f"transcript={transcript!r} missing={missing!r}",
+        )
+
+
+def test_find_session_matches_full_and_prefix() -> None:
+    reset_db()
+    now = datetime.now(UTC).isoformat()
+    session_id = "unique01-session-001"
+    archive_path = db.archive_session_path("__validation__", session_id)
+    os.makedirs(os.path.dirname(archive_path), exist_ok=True)
+    with open(archive_path, "w") as f:
+        f.write(
+            json.dumps(
+                {
+                    "ts": now,
+                    "kind": "prompt",
+                    "scope": "__validation__",
+                    "data": {"prompt": "find session marker"},
+                }
+            )
+            + "\n"
+        )
+
+    conn = db.get_db()
+    db.upsert_session_archive_index(
+        conn,
+        session_id,
+        "__validation__",
+        now,
+        archive_path,
+        db.build_archive_index_text(archive_path),
+    )
+    conn.commit()
+    by_full = db.find_session_matches(conn, session_id, "__validation__")
+    by_prefix = db.find_session_matches(conn, session_id[:8], "__validation__")
+    conn.close()
+
+    if (
+        len(by_full) == 1
+        and by_full[0]["session_id"] == session_id
+        and len(by_prefix) == 1
+        and by_prefix[0]["session_id"] == session_id
+    ):
+        ok("find_session_matches_full_and_prefix")
+    else:
+        fail(
+            "find_session_matches_full_and_prefix",
+            f"by_full={by_full} by_prefix={by_prefix}",
+        )
+
+
+def test_resolve_session_id_requires_single_match() -> None:
+    reset_db()
+    now = datetime.now(UTC).isoformat()
+    sessions = [
+        "dupe0001-session-alpha",
+        "dupe0001-session-beta",
+        "solo0001-session-alpha",
+    ]
+    conn = db.get_db()
+    for session_id in sessions:
+        archive_path = db.archive_session_path("__validation__", session_id)
+        os.makedirs(os.path.dirname(archive_path), exist_ok=True)
+        with open(archive_path, "w") as f:
+            f.write(
+                json.dumps(
+                    {
+                        "ts": now,
+                        "kind": "prompt",
+                        "scope": "__validation__",
+                        "data": {"prompt": f"resolve marker {session_id}"},
+                    }
+                )
+                + "\n"
+            )
+        db.upsert_session_archive_index(
+            conn,
+            session_id,
+            "__validation__",
+            now,
+            archive_path,
+            db.build_archive_index_text(archive_path),
+        )
+    conn.commit()
+
+    unique = db.resolve_session_id(conn, "solo0001", "__validation__")
+    exact = db.resolve_session_id(conn, "dupe0001-session-alpha", "__validation__")
+    ambiguous = db.resolve_session_id(conn, "dupe0001", "__validation__")
+    conn.close()
+
+    if (
+        unique == "solo0001-session-alpha"
+        and exact == "dupe0001-session-alpha"
+        and ambiguous is None
+    ):
+        ok("resolve_session_id_requires_single_match")
+    else:
+        fail(
+            "resolve_session_id_requires_single_match",
+            f"unique={unique!r} exact={exact!r} ambiguous={ambiguous!r}",
+        )
+
+
 if __name__ == "__main__":
     try:
         test_extract_memory_metadata_defaults()
         test_extract_memory_metadata_normalizes_values()
+        test_llm_call_dispatches_ollama_backend()
+        test_llm_call_dispatches_unknown_backend_to_ollama()
+        test_llm_call_dispatches_lm_studio_backend()
+        test_llm_call_dispatches_lmstudio_alias()
+        test_llm_call_dispatches_bedrock_backend()
+        test_llm_call_dispatches_codex_backend()
+        test_extract_json_object_parses_common_llm_shapes()
+        test_extract_json_object_repairs_trailing_commas_and_falls_back()
+        test_extract_json_array_parses_embedded_and_malformed_inputs()
+        test_strip_fences_handles_tags_and_passthrough()
+        test_repair_json_removes_trailing_commas()
+        test_resolve_codex_bin_prefers_module_attr_then_path_default()
+        test_codex_call_builds_offline_argv_and_cleans_output()
+        test_claude_load_settings_returns_empty_for_missing_and_bad_json()
+        test_claude_entry_has_command_matches_only_list_hooks()
+        test_claude_install_hooks_adds_all_events_and_is_idempotent()
+        test_claude_backup_settings_copies_existing_settings()
+        test_codex_load_hooks_returns_default_for_missing_and_bad_shapes()
+        test_codex_install_hooks_writes_all_events_and_is_idempotent()
+        test_codex_env_helpers_include_only_set_keys_and_quote_commands()
+        test_codex_hook_command_quotes_shell_sensitive_args()
+        test_llm_safe_fallbacks_when_llm_call_raises()
         test_memory_query_clamps_limit()
         test_memory_query_tracks_access()
         test_memory_consolidate_ignores_invalid_actions()
@@ -1201,6 +2476,18 @@ if __name__ == "__main__":
         test_memory_get_full_and_prefix()
         test_memory_timeline_orders_and_filters()
         test_memory_list_and_timeline_exclude_stale_by_default()
+        test_hook_derive_scope_uses_git_root_or_path_basename()
+        test_hook_payload_value_respects_precedence_and_defaults()
+        test_hook_payload_cwd_aliases_and_pwd_fallback()
+        test_hook_payload_session_id_aliases_and_env_fallback()
+        test_hook_truncate_limits_strings_dicts_and_lists()
+        test_hook_session_path_sanitizes_ids_under_sessions_dir()
+        test_hook_append_event_writes_prompt_and_tool_use_only()
+        test_hook_read_buffer_skips_invalid_lines_and_missing_files()
+        test_hook_remove_buffer_deletes_existing_and_ignores_missing()
+        test_hook_build_transcript_formats_limits_and_caps_events()
+        test_hook_parse_string_list_filters_and_caps_items()
+        test_hook_parse_memory_item_accepts_strings_and_dicts()
         test_hook_summarize_inserts_memory()
         test_hook_summarize_stores_open_actions()
         test_hook_summarize_handles_noisy_open_actions()
@@ -1219,6 +2506,14 @@ if __name__ == "__main__":
         test_memory_session_get_returns_transcript()
         test_memory_session_get_uses_scope_for_ambiguous_prefix()
         test_memory_session_search_finds_archived_content()
+        test_extract_search_terms_filters_and_limits()
+        test_build_memory_filters_composes_conditions()
+        test_format_archive_event_outputs_expected_text()
+        test_flatten_archive_line_outputs_index_text()
+        test_build_archive_index_text_flattens_file()
+        test_read_archive_transcript_limits_and_missing()
+        test_find_session_matches_full_and_prefix()
+        test_resolve_session_id_requires_single_match()
     finally:
         restore_state()
 
