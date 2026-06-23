@@ -2556,6 +2556,318 @@ def test_lifecycle_stales_old_high_importance_unpinned_memory() -> None:
         )
 
 
+def test_iter_session_buffers_filters_stale_jsonl_files() -> None:
+    reset_db()
+    os.makedirs(TEST_SESSIONS, exist_ok=True)
+    stale_path = os.path.join(TEST_SESSIONS, "stale-session.jsonl")
+    fresh_path = os.path.join(TEST_SESSIONS, "fresh-session.jsonl")
+    ignored_path = os.path.join(TEST_SESSIONS, "old-note.txt")
+    for path in [stale_path, fresh_path, ignored_path]:
+        with open(path, "w") as f:
+            f.write("{}\n")
+
+    old_stamp = (datetime.now(UTC) - timedelta(seconds=120)).timestamp()
+    os.utime(stale_path, (old_stamp, old_stamp))
+    os.utime(ignored_path, (old_stamp, old_stamp))
+
+    buffers = sorted(os.path.basename(path) for path in db.iter_session_buffers(60))
+    if buffers == ["stale-session.jsonl"]:
+        ok("iter_session_buffers_filters_stale_jsonl_files")
+    else:
+        fail("iter_session_buffers_filters_stale_jsonl_files", f"buffers={buffers}")
+
+
+def test_archive_session_buffer_moves_file_and_indexes_base_row() -> None:
+    reset_db()
+    session_id = "archive-buffer-001"
+    buffer_path = os.path.join(TEST_SESSIONS, f"{session_id}.jsonl")
+    prompt_text = "archive buffer synthetic prompt"
+    with open(buffer_path, "w") as f:
+        f.write(json.dumps({"kind": "prompt", "data": {"prompt": prompt_text}}) + "\n")
+        f.write(json.dumps({"kind": "note", "data": {"detail": "done"}}) + "\n")
+
+    archive_path = db.archive_session_buffer(
+        buffer_path, "__validation__", session_id=session_id
+    )
+    missing = db.archive_session_buffer(
+        os.path.join(TEST_SESSIONS, "missing.jsonl"), "__validation__"
+    )
+    conn = db.get_db()
+    row = conn.execute(
+        """
+        SELECT session_id, scope, archive_path, index_text
+        FROM session_archive
+        WHERE session_id = ?
+        """,
+        (session_id,),
+    ).fetchone()
+    conn.close()
+
+    if (
+        archive_path
+        and not os.path.exists(buffer_path)
+        and os.path.exists(archive_path)
+        and row
+        and row["session_id"] == session_id
+        and row["scope"] == "__validation__"
+        and row["archive_path"] == archive_path
+        and prompt_text in row["index_text"]
+        and missing is None
+    ):
+        ok("archive_session_buffer_moves_file_and_indexes_base_row")
+    else:
+        fail(
+            "archive_session_buffer_moves_file_and_indexes_base_row",
+            f"archive_path={archive_path} row={dict(row) if row else None} "
+            f"missing={missing}",
+        )
+
+
+def test_list_recent_archived_sessions_orders_and_clamps_limit() -> None:
+    reset_db()
+    base = datetime(2026, 1, 1, tzinfo=UTC)
+    conn = db.get_db()
+    for idx in range(55):
+        session_id = f"scope-session-{idx:03d}"
+        db.upsert_session_archive_index(
+            conn,
+            session_id,
+            "__validation__",
+            (base + timedelta(seconds=idx)).isoformat(),
+            db.archive_session_path("__validation__", session_id),
+            f"index text {idx}",
+        )
+    db.upsert_session_archive_index(
+        conn,
+        "other-scope-session",
+        "other-scope",
+        (base + timedelta(seconds=999)).isoformat(),
+        db.archive_session_path("other-scope", "other-scope-session"),
+        "other scope text",
+    )
+    conn.commit()
+
+    top_three = db.list_recent_archived_sessions(conn, "__validation__", limit=3)
+    wide = db.list_recent_archived_sessions(conn, "__validation__", limit=999)
+    low = db.list_recent_archived_sessions(conn, "__validation__", limit=0)
+    conn.close()
+
+    top_ids = [row["session_id"] for row in top_three]
+    if (
+        top_ids == ["scope-session-054", "scope-session-053", "scope-session-052"]
+        and len(wide) == 50
+        and wide[0]["session_id"] == "scope-session-054"
+        and wide[-1]["session_id"] == "scope-session-005"
+        and len(low) == 1
+        and low[0]["session_id"] == "scope-session-054"
+    ):
+        ok("list_recent_archived_sessions_orders_and_clamps_limit")
+    else:
+        fail(
+            "list_recent_archived_sessions_orders_and_clamps_limit",
+            f"top_ids={top_ids} wide={len(wide)} low={len(low)}",
+        )
+
+
+def test_delete_session_archive_fts_removes_only_fts_row() -> None:
+    reset_db()
+    session_id = "delete-fts-session-001"
+    archive_path = db.archive_session_path("__validation__", session_id)
+    conn = db.get_db()
+    db.upsert_session_archive_index(
+        conn,
+        session_id,
+        "__validation__",
+        datetime.now(UTC).isoformat(),
+        archive_path,
+        "delete fts synthetic content",
+    )
+    conn.commit()
+    try:
+        before_fts = conn.execute(
+            "SELECT COUNT(*) AS count FROM session_archive_fts WHERE session_id = ?",
+            (session_id,),
+        ).fetchone()["count"]
+        has_fts = True
+    except sqlite3.OperationalError:
+        before_fts = 0
+        has_fts = False
+
+    db.delete_session_archive_fts(conn, session_id)
+    conn.commit()
+    base_row = conn.execute(
+        "SELECT session_id FROM session_archive WHERE session_id = ?",
+        (session_id,),
+    ).fetchone()
+    try:
+        after_fts = conn.execute(
+            "SELECT COUNT(*) AS count FROM session_archive_fts WHERE session_id = ?",
+            (session_id,),
+        ).fetchone()["count"]
+    except sqlite3.OperationalError:
+        after_fts = 0
+    conn.close()
+
+    if base_row and ((not has_fts) or (before_fts == 1 and after_fts == 0)):
+        ok("delete_session_archive_fts_removes_only_fts_row")
+    else:
+        fail(
+            "delete_session_archive_fts_removes_only_fts_row",
+            f"base_row={base_row} has_fts={has_fts} before={before_fts} "
+            f"after={after_fts}",
+        )
+
+
+def test_write_proposal_round_trips_scope_and_content() -> None:
+    reset_db()
+    proposal = {
+        "summary": "synthetic curator proposal",
+        "actions": [
+            {
+                "type": "update",
+                "id": "proposal-memory-001",
+                "new_content": "synthetic updated memory",
+            }
+        ],
+    }
+    path = db.write_proposal("__validation__", proposal)
+    with open(path) as f:
+        payload = json.load(f)
+
+    if (
+        path
+        and os.path.exists(path)
+        and os.path.dirname(path) == TEST_PROPOSALS
+        and payload["scope"] == "__validation__"
+        and payload["summary"] == proposal["summary"]
+        and payload["actions"] == proposal["actions"]
+        and payload["created_at"]
+    ):
+        ok("write_proposal_round_trips_scope_and_content")
+    else:
+        fail(
+            "write_proposal_round_trips_scope_and_content",
+            f"path={path} payload={payload}",
+        )
+
+
+def test_write_backup_snapshot_round_trips_scope_and_memories() -> None:
+    reset_db()
+    first_id = "abababab-abab-abab-abab-abababababab"
+    other_id = "cdcdcdcd-cdcd-cdcd-cdcd-cdcdcdcdcdcd"
+    insert_memory(first_id, "synthetic backup memory", scope="__validation__")
+    insert_memory(other_id, "other scope memory", scope="other-scope")
+
+    path = db.write_backup_snapshot("__validation__")
+    with open(path) as f:
+        payload = json.load(f)
+    memory_ids = [memory["id"] for memory in payload["memories"]]
+
+    if (
+        path
+        and os.path.exists(path)
+        and os.path.dirname(path) == TEST_BACKUPS
+        and payload["scope"] == "__validation__"
+        and memory_ids == [first_id]
+        and payload["memories"][0]["content"] == "synthetic backup memory"
+        and payload["created_at"]
+    ):
+        ok("write_backup_snapshot_round_trips_scope_and_memories")
+    else:
+        fail(
+            "write_backup_snapshot_round_trips_scope_and_memories",
+            f"path={path} payload={payload}",
+        )
+
+
+def test_touch_memories_updates_unique_existing_ids() -> None:
+    reset_db()
+    first_id = "11112222-3333-4444-5555-666677778888"
+    second_id = "22223333-4444-5555-6666-777788889999"
+    untouched_id = "33334444-5555-6666-7777-888899990000"
+    insert_memory(first_id, "first memory")
+    insert_memory(second_id, "second memory")
+    insert_memory(untouched_id, "untouched memory")
+
+    conn = db.get_db()
+    db.touch_memories(
+        conn,
+        [first_id, f" {first_id} ", second_id, "missing-memory-id", ""],
+    )
+    conn.commit()
+    rows = conn.execute(
+        """
+        SELECT id, access_count, last_accessed_at
+        FROM memories
+        ORDER BY id
+        """
+    ).fetchall()
+    conn.close()
+    counts = {
+        row["id"]: (row["access_count"], row["last_accessed_at"]) for row in rows
+    }
+
+    if (
+        counts[first_id][0] == 1
+        and counts[first_id][1]
+        and counts[second_id][0] == 1
+        and counts[second_id][1]
+        and counts[untouched_id] == (0, "")
+    ):
+        ok("touch_memories_updates_unique_existing_ids")
+    else:
+        fail("touch_memories_updates_unique_existing_ids", f"counts={counts}")
+
+
+def test_resolve_memory_id_returns_unique_match_and_none_for_ambiguous_prefix() -> None:
+    reset_db()
+    first_id = "abcdef12-0000-0000-0000-000000000000"
+    second_id = "abcdef12-1111-1111-1111-111111111111"
+    unique_id = "fedcba98-2222-2222-2222-222222222222"
+    insert_memory(first_id, "ambiguous memory one")
+    insert_memory(second_id, "ambiguous memory two")
+    insert_memory(unique_id, "unique memory")
+
+    conn = db.get_db()
+    unique = db.resolve_memory_id(conn, "fedcba98", "__validation__")
+    exact = db.resolve_memory_id(conn, first_id, "__validation__")
+    ambiguous = db.resolve_memory_id(conn, "abcdef12", "__validation__")
+    short = db.resolve_memory_id(conn, "abc", "__validation__")
+    conn.close()
+
+    if unique == unique_id and exact == first_id and ambiguous is None and short is None:
+        ok("resolve_memory_id_returns_unique_match_and_none_for_ambiguous_prefix")
+    else:
+        fail(
+            "resolve_memory_id_returns_unique_match_and_none_for_ambiguous_prefix",
+            f"unique={unique!r} exact={exact!r} ambiguous={ambiguous!r} "
+            f"short={short!r}",
+        )
+
+
+def test_list_memory_scopes_returns_distinct_non_empty_scopes() -> None:
+    reset_db()
+    insert_memory(
+        "44444444-4444-4444-4444-444444444444", "validation", "__validation__"
+    )
+    insert_memory("55555555-5555-5555-5555-555555555555", "alpha one", "alpha")
+    insert_memory("66666666-6666-6666-6666-666666666666", "alpha two", "alpha")
+    insert_memory("77777777-7777-7777-7777-777777777777", "zeta", "zeta")
+    insert_memory("88888888-8888-8888-8888-888888888888", "empty scope", "")
+
+    conn = db.get_db()
+    scopes = db.list_memory_scopes(conn)
+    conn.close()
+
+    if scopes == ["__validation__", "alpha", "zeta"]:
+        ok("list_memory_scopes_returns_distinct_non_empty_scopes")
+    else:
+        fail(
+            "list_memory_scopes_returns_distinct_non_empty_scopes",
+            f"scopes={scopes}",
+        )
+
+
 def test_memory_session_get_returns_transcript() -> None:
     reset_db()
     session_id = "session-get-full-001"
@@ -3054,6 +3366,15 @@ if __name__ == "__main__":
         test_large_hot_memory_does_not_crowd_out_pinned_warm_memory()
         test_inject_excludes_archive_pointers_by_default()
         test_lifecycle_stales_old_high_importance_unpinned_memory()
+        test_iter_session_buffers_filters_stale_jsonl_files()
+        test_archive_session_buffer_moves_file_and_indexes_base_row()
+        test_list_recent_archived_sessions_orders_and_clamps_limit()
+        test_delete_session_archive_fts_removes_only_fts_row()
+        test_write_proposal_round_trips_scope_and_content()
+        test_write_backup_snapshot_round_trips_scope_and_memories()
+        test_touch_memories_updates_unique_existing_ids()
+        test_resolve_memory_id_returns_unique_match_and_none_for_ambiguous_prefix()
+        test_list_memory_scopes_returns_distinct_non_empty_scopes()
         test_memory_session_get_returns_transcript()
         test_memory_session_get_uses_scope_for_ambiguous_prefix()
         test_memory_session_search_finds_archived_content()
