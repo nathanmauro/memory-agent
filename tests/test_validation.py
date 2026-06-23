@@ -7,6 +7,7 @@ import json
 import os
 import shlex
 import shutil
+import sqlite3
 import subprocess
 import tempfile
 from datetime import UTC, datetime, timedelta
@@ -171,6 +172,23 @@ def access_counts() -> dict[str, tuple[int, str]]:
         row["id"]: (row["access_count"], row["last_accessed_at"])
         for row in rows
     }
+
+
+def fts_has_memory(conn, mem_id: str, content: str = "", tags: str = "") -> bool:
+    try:
+        row = conn.execute(
+            "SELECT content, tags FROM memories_fts WHERE id = ?",
+            (mem_id,),
+        ).fetchone()
+    except sqlite3.OperationalError:
+        return True
+    if not row:
+        return False
+    if content and row["content"] != content:
+        return False
+    if tags and row["tags"] != tags:
+        return False
+    return True
 
 
 def test_extract_memory_metadata_defaults() -> None:
@@ -885,6 +903,397 @@ def test_memory_index_excludes_stale_by_default() -> None:
         fail(
             "memory_index_excludes_stale_by_default",
             f"default={default_result} stale={stale_result}",
+        )
+
+
+def test_insert_memory_explicit_category_skips_llm_and_sets_importance() -> None:
+    reset_db()
+    calls = {"count": 0}
+
+    def should_not_call(system, user):
+        calls["count"] += 1
+        raise AssertionError("explicit category should not call the LLM")
+
+    llm.llm_call = should_not_call
+    conn = db.get_db()
+    open_result = tools._insert_memory(
+        conn,
+        "add coverage for direct open action insert",
+        "__validation__",
+        "test",
+        category="OPEN_ACTION",
+        tags=" Tests, offline ",
+    )
+    decision_result = tools._insert_memory(
+        conn,
+        "record the direct category branch decision",
+        "__validation__",
+        "test",
+        category="code_decision",
+        tags=" decision ",
+    )
+    conn.commit()
+    rows = conn.execute(
+        """
+        SELECT id, content, category, tags, importance FROM memories
+        WHERE scope = ?
+        """,
+        ("__validation__",),
+    ).fetchall()
+    by_content = {row["content"]: row for row in rows}
+    open_row = by_content.get("add coverage for direct open action insert")
+    decision_row = by_content.get("record the direct category branch decision")
+    fts_ok = (
+        open_row
+        and decision_row
+        and fts_has_memory(
+            conn,
+            open_row["id"],
+            "add coverage for direct open action insert",
+            "tests,offline",
+        )
+        and fts_has_memory(
+            conn,
+            decision_row["id"],
+            "record the direct category branch decision",
+            "decision",
+        )
+    )
+    conn.close()
+
+    if (
+        calls["count"] == 0
+        and open_result.startswith("Stored memory ")
+        and decision_result.startswith("Stored memory ")
+        and len(rows) == 2
+        and open_row
+        and open_row["category"] == "open_action"
+        and open_row["tags"] == "tests,offline"
+        and open_row["importance"] == 4
+        and decision_row
+        and decision_row["category"] == "code_decision"
+        and decision_row["tags"] == "decision"
+        and decision_row["importance"] == 3
+        and fts_ok
+    ):
+        ok("insert_memory_explicit_category_skips_llm_and_sets_importance")
+    else:
+        fail(
+            "insert_memory_explicit_category_skips_llm_and_sets_importance",
+            f"calls={calls['count']} open={dict(open_row) if open_row else None} "
+            f"decision={dict(decision_row) if decision_row else None} "
+            f"fts_ok={fts_ok} results={[open_result, decision_result]}",
+        )
+
+
+def test_insert_memory_merges_existing_memory_in_place() -> None:
+    reset_db()
+    conn = db.get_db()
+    seed_result = tools._insert_memory(
+        conn,
+        "old merge target content",
+        "__validation__",
+        "seed",
+        category="project_knowledge",
+        tags="old",
+    )
+    seed_id = seed_result.split()[2]
+    old_updated_at = "2020-01-01T00:00:00+00:00"
+    conn.execute(
+        "UPDATE memories SET updated_at = ? WHERE id = ?",
+        (old_updated_at, seed_id),
+    )
+    conn.commit()
+
+    llm.llm_call = lambda system, user: json.dumps(
+        {
+            "category": "code_decision",
+            "tags": " Merge, direct ",
+            "importance": 5,
+            "merge_with_id": seed_id,
+            "merged_content": "merged target content with new detail",
+        }
+    )
+    before_count = conn.execute(
+        "SELECT COUNT(*) AS n FROM memories WHERE scope = ?",
+        ("__validation__",),
+    ).fetchone()["n"]
+    result = tools._insert_memory(
+        conn,
+        "new merge detail",
+        "__validation__",
+        "test",
+    )
+    conn.commit()
+    after_count = conn.execute(
+        "SELECT COUNT(*) AS n FROM memories WHERE scope = ?",
+        ("__validation__",),
+    ).fetchone()["n"]
+    row = conn.execute(
+        "SELECT * FROM memories WHERE id = ? AND scope = ?",
+        (seed_id, "__validation__"),
+    ).fetchone()
+    fts_ok = fts_has_memory(
+        conn,
+        seed_id,
+        "merged target content with new detail",
+        "merge,direct",
+    )
+    conn.close()
+
+    if (
+        result == f"Merged with existing memory {seed_id}"
+        and before_count == 1
+        and after_count == 1
+        and row
+        and row["content"] == "merged target content with new detail"
+        and row["category"] == "code_decision"
+        and row["tags"] == "merge,direct"
+        and row["importance"] == 5
+        and row["updated_at"] != old_updated_at
+        and fts_ok
+    ):
+        ok("insert_memory_merges_existing_memory_in_place")
+    else:
+        fail(
+            "insert_memory_merges_existing_memory_in_place",
+            f"result={result!r} counts=({before_count},{after_count}) "
+            f"row={dict(row) if row else None} fts_ok={fts_ok}",
+        )
+
+
+def test_insert_memory_drops_stale_merge_id_and_inserts_fresh_row() -> None:
+    reset_db()
+    conn = db.get_db()
+    seed_result = tools._insert_memory(
+        conn,
+        "existing guard target remains untouched",
+        "__validation__",
+        "seed",
+        category="project_knowledge",
+    )
+    seed_id = seed_result.split()[2]
+    conn.commit()
+
+    stale_id = "99999999-9999-9999-9999-999999999999"
+    llm.llm_call = lambda system, user: json.dumps(
+        {
+            "category": "session_summary",
+            "tags": " guard ",
+            "importance": 4,
+            "merge_with_id": stale_id,
+            "merged_content": "should not overwrite anything",
+        }
+    )
+    before_count = conn.execute(
+        "SELECT COUNT(*) AS n FROM memories WHERE scope = ?",
+        ("__validation__",),
+    ).fetchone()["n"]
+    result = tools._insert_memory(
+        conn,
+        "fresh row after stale merge guard",
+        "__validation__",
+        "test",
+    )
+    conn.commit()
+    after_count = conn.execute(
+        "SELECT COUNT(*) AS n FROM memories WHERE scope = ?",
+        ("__validation__",),
+    ).fetchone()["n"]
+    seed_row = conn.execute(
+        "SELECT content FROM memories WHERE id = ?",
+        (seed_id,),
+    ).fetchone()
+    stale_row = conn.execute(
+        "SELECT id FROM memories WHERE id = ?",
+        (stale_id,),
+    ).fetchone()
+    fresh_id = result.split()[2] if result.startswith("Stored memory ") else ""
+    fresh_row = conn.execute(
+        "SELECT * FROM memories WHERE id = ?",
+        (fresh_id,),
+    ).fetchone()
+    fts_ok = bool(fresh_row) and fts_has_memory(
+        conn,
+        fresh_id,
+        "fresh row after stale merge guard",
+        "guard",
+    )
+    conn.close()
+
+    if (
+        result.startswith("Stored memory ")
+        and before_count == 1
+        and after_count == 2
+        and seed_row
+        and seed_row["content"] == "existing guard target remains untouched"
+        and stale_row is None
+        and fresh_row
+        and fresh_row["content"] == "fresh row after stale merge guard"
+        and fresh_row["category"] == "session_summary"
+        and fresh_row["tags"] == "guard"
+        and fresh_row["importance"] == 4
+        and fts_ok
+    ):
+        ok("insert_memory_drops_stale_merge_id_and_inserts_fresh_row")
+    else:
+        fail(
+            "insert_memory_drops_stale_merge_id_and_inserts_fresh_row",
+            f"result={result!r} counts=({before_count},{after_count}) "
+            f"seed={dict(seed_row) if seed_row else None} "
+            f"fresh={dict(fresh_row) if fresh_row else None} fts_ok={fts_ok}",
+        )
+
+
+def test_gather_candidates_returns_fts_matchable_records() -> None:
+    reset_db()
+    conn = db.get_db()
+    match_result = tools._insert_memory(
+        conn,
+        "vectorclock retrieval target",
+        "__validation__",
+        "test",
+        category="project_knowledge",
+        tags="retrieval",
+    )
+    miss_result = tools._insert_memory(
+        conn,
+        "unrelated checkpoint note",
+        "__validation__",
+        "test",
+        category="project_knowledge",
+        tags="other",
+    )
+    conn.commit()
+    match_id = match_result.split()[2]
+    miss_id = miss_result.split()[2]
+
+    candidates = tools._gather_candidates(
+        conn,
+        "vectorclock",
+        scope="__validation__",
+    )
+    ids = [candidate.id for candidate in candidates]
+    conn.close()
+
+    if match_id in ids and miss_id not in ids:
+        ok("gather_candidates_returns_fts_matchable_records")
+    else:
+        fail(
+            "gather_candidates_returns_fts_matchable_records",
+            f"ids={ids} match={match_id} miss={miss_id}",
+        )
+
+
+def test_gather_candidates_like_fallback_adds_substring_matches_once() -> None:
+    reset_db()
+    conn = db.get_db()
+    exact_result = tools._insert_memory(
+        conn,
+        "pha exact token memory",
+        "__validation__",
+        "test",
+        category="project_knowledge",
+    )
+    substring_result = tools._insert_memory(
+        conn,
+        "alpha substring memory",
+        "__validation__",
+        "test",
+        category="project_knowledge",
+    )
+    miss_result = tools._insert_memory(
+        conn,
+        "beta unrelated memory",
+        "__validation__",
+        "test",
+        category="project_knowledge",
+    )
+    conn.commit()
+    exact_id = exact_result.split()[2]
+    substring_id = substring_result.split()[2]
+    miss_id = miss_result.split()[2]
+
+    candidates = tools._gather_candidates(conn, "pha", scope="__validation__")
+    ids = [candidate.id for candidate in candidates]
+    conn.close()
+
+    if (
+        exact_id in ids
+        and substring_id in ids
+        and miss_id not in ids
+        and len(ids) == len(set(ids))
+    ):
+        ok("gather_candidates_like_fallback_adds_substring_matches_once")
+    else:
+        fail(
+            "gather_candidates_like_fallback_adds_substring_matches_once",
+            f"ids={ids} exact={exact_id} substring={substring_id} miss={miss_id}",
+        )
+
+
+def test_gather_candidates_filters_scope_and_active_status() -> None:
+    reset_db()
+    conn = db.get_db()
+    active_result = tools._insert_memory(
+        conn,
+        "scopefilter active target memory",
+        "__validation__",
+        "test",
+        category="project_knowledge",
+    )
+    stale_result = tools._insert_memory(
+        conn,
+        "scopefilter stale target memory",
+        "__validation__",
+        "test",
+        category="project_knowledge",
+    )
+    other_scope_result = tools._insert_memory(
+        conn,
+        "scopefilter other scope memory",
+        "__other__",
+        "test",
+        category="project_knowledge",
+    )
+    conn.execute(
+        "UPDATE memories SET status = 'stale' WHERE id = ?",
+        (stale_result.split()[2],),
+    )
+    conn.commit()
+    active_id = active_result.split()[2]
+    stale_id = stale_result.split()[2]
+    other_scope_id = other_scope_result.split()[2]
+
+    default_candidates = tools._gather_candidates(
+        conn,
+        "scopefilter",
+        scope="__validation__",
+    )
+    stale_candidates = tools._gather_candidates(
+        conn,
+        "scopefilter",
+        scope="__validation__",
+        status="stale",
+    )
+    default_ids = [candidate.id for candidate in default_candidates]
+    stale_ids = [candidate.id for candidate in stale_candidates]
+    conn.close()
+
+    if (
+        active_id in default_ids
+        and stale_id not in default_ids
+        and other_scope_id not in default_ids
+        and stale_id in stale_ids
+        and active_id not in stale_ids
+        and other_scope_id not in stale_ids
+    ):
+        ok("gather_candidates_filters_scope_and_active_status")
+    else:
+        fail(
+            "gather_candidates_filters_scope_and_active_status",
+            f"default={default_ids} stale={stale_ids} "
+            f"active={active_id} stale_id={stale_id} other={other_scope_id}",
         )
 
 
@@ -2473,6 +2882,12 @@ if __name__ == "__main__":
         test_curator_runs_lifecycle_and_proposal()
         test_memory_index_no_llm_call()
         test_memory_index_excludes_stale_by_default()
+        test_insert_memory_explicit_category_skips_llm_and_sets_importance()
+        test_insert_memory_merges_existing_memory_in_place()
+        test_insert_memory_drops_stale_merge_id_and_inserts_fresh_row()
+        test_gather_candidates_returns_fts_matchable_records()
+        test_gather_candidates_like_fallback_adds_substring_matches_once()
+        test_gather_candidates_filters_scope_and_active_status()
         test_memory_get_full_and_prefix()
         test_memory_timeline_orders_and_filters()
         test_memory_list_and_timeline_exclude_stale_by_default()
