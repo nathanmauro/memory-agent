@@ -12,8 +12,8 @@ import subprocess
 import tempfile
 from datetime import UTC, datetime, timedelta
 
-from mcp_memory_agent import db, hook_handler, hot, llm, tools
-from mcp_memory_agent.integrations import claude, codex
+from mcp_memory_agent import db, hook_handler, hot, install, llm, tools
+from mcp_memory_agent.integrations import claude, codex, common
 from mcp_memory_agent.models import MemoryRecord
 
 PASS = 0
@@ -507,6 +507,140 @@ def test_codex_call_builds_offline_argv_and_cleans_output() -> None:
             os.environ.pop("CODEX_EXTRA_ARGS", None)
         else:
             os.environ["CODEX_EXTRA_ARGS"] = original_extra
+
+
+def test_entry_point_command_prefers_local_path_then_module() -> None:
+    name = "entry_point_command_prefers_local_path_then_module"
+    original_executable = common.sys.executable
+    original_which = common.shutil.which
+    with tempfile.TemporaryDirectory(prefix="memory validation ") as root:
+        try:
+            bin_dir = os.path.join(root, "venv bin")
+            path_dir = os.path.join(root, "path bin")
+            os.makedirs(bin_dir, exist_ok=True)
+            os.makedirs(path_dir, exist_ok=True)
+            script_name = "mcp-memory-agent-hook"
+            module_name = "mcp_memory_agent.hook_handler"
+            executable = os.path.join(bin_dir, "python")
+            local_script = os.path.join(bin_dir, script_name)
+            path_script = os.path.join(path_dir, script_name)
+            calls = []
+
+            def fake_which(name: str) -> str | None:
+                calls.append(name)
+                if name == script_name:
+                    return path_script
+                return None
+
+            def fake_missing_which(name: str) -> str | None:
+                return None
+
+            common.sys.executable = executable
+            common.shutil.which = fake_which
+
+            with open(local_script, "w") as f:
+                f.write("#!/bin/sh\n")
+            local_result = common.entry_point_command(script_name, module_name)
+
+            os.remove(local_script)
+            path_result = common.entry_point_command(script_name, module_name)
+
+            common.shutil.which = fake_missing_which
+            fallback_result = common.entry_point_command(script_name, module_name)
+
+            expected_fallback = f"{shlex.quote(executable)} -m {module_name}"
+            if (
+                local_result == shlex.quote(local_script)
+                and path_result == shlex.quote(path_script)
+                and fallback_result == expected_fallback
+                and calls == [script_name]
+            ):
+                ok(name)
+            else:
+                fail(
+                    name,
+                    (
+                        f"local={local_result!r} path={path_result!r} "
+                        f"fallback={fallback_result!r} calls={calls!r}"
+                    ),
+                )
+        except Exception as e:
+            fail(name, str(e))
+        finally:
+            common.sys.executable = original_executable
+            common.shutil.which = original_which
+
+
+def test_install_main_routes_clients_and_sums_hooks() -> None:
+    import contextlib
+    import io
+    import sys
+
+    name = "install_main_routes_clients_and_sums_hooks"
+    original_argv = sys.argv
+    original_claude_install = install.claude.install
+    original_codex_install = install.codex.install
+    calls = []
+
+    def fake_claude_install() -> int:
+        calls.append(("claude", ""))
+        return 2
+
+    def fake_codex_install(project_dir: str) -> int:
+        calls.append(("codex", project_dir))
+        return 3
+
+    def run_install(client: str, project_dir: str) -> tuple[list[tuple[str, str]], str]:
+        calls.clear()
+        sys.argv = [
+            "install",
+            "--client",
+            client,
+            "--project-dir",
+            project_dir,
+        ]
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            install.main()
+        return calls[:], output.getvalue()
+
+    with tempfile.TemporaryDirectory() as root:
+        try:
+            install.claude.install = fake_claude_install
+            install.codex.install = fake_codex_install
+
+            claude_project = os.path.join(root, "claude-project")
+            codex_project = os.path.join(root, "codex-project")
+            both_project = os.path.join(root, "both-project")
+            claude_calls, claude_output = run_install("claude", claude_project)
+            codex_calls, codex_output = run_install("codex", codex_project)
+            both_calls, both_output = run_install("both", both_project)
+
+            if (
+                claude_calls == [("claude", "")]
+                and codex_calls == [("codex", codex_project)]
+                and both_calls == [("claude", ""), ("codex", both_project)]
+                and "Hooks added: 2 " in claude_output
+                and "Hooks added: 3 " in codex_output
+                and "Hooks added: 5 " in both_output
+            ):
+                ok(name)
+            else:
+                fail(
+                    name,
+                    (
+                        f"claude_calls={claude_calls!r} "
+                        f"codex_calls={codex_calls!r} both_calls={both_calls!r} "
+                        f"claude_output={claude_output!r} "
+                        f"codex_output={codex_output!r} both_output={both_output!r}"
+                    ),
+                )
+        except Exception as e:
+            fail(name, str(e))
+        finally:
+            install.claude.install = original_claude_install
+            install.codex.install = original_codex_install
+            sys.argv = original_argv
 
 
 def test_claude_load_settings_returns_empty_for_missing_and_bad_json() -> None:
@@ -2865,6 +2999,8 @@ if __name__ == "__main__":
         test_repair_json_removes_trailing_commas()
         test_resolve_codex_bin_prefers_module_attr_then_path_default()
         test_codex_call_builds_offline_argv_and_cleans_output()
+        test_entry_point_command_prefers_local_path_then_module()
+        test_install_main_routes_clients_and_sums_hooks()
         test_claude_load_settings_returns_empty_for_missing_and_bad_json()
         test_claude_entry_has_command_matches_only_list_hooks()
         test_claude_install_hooks_adds_all_events_and_is_idempotent()
